@@ -2445,11 +2445,12 @@ impl Application {
                 .as_path(),
         )?;
         let record = state.task(&task_id)?;
+        let active_session = current_process_group()
+            .map(|pgid| state.active_session_for_process_group(pgid))
+            .transpose()?
+            .flatten();
         if is_administrative_shim_command(&raw)
-            && (std::env::var_os("AGENTREE_SESSION_ID").is_some()
-                || current_process_group()
-                    .and_then(|pgid| state.active_session_for_process_group(pgid).ok().flatten())
-                    .is_some())
+            && (std::env::var_os("AGENTREE_SESSION_ID").is_some() || active_session.is_some())
         {
             return Err(AppError::diagnostic(
                 "AGT-0742",
