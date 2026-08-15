@@ -309,6 +309,27 @@ impl State {
         Ok(())
     }
 
+    pub fn update_session_identity(
+        &self,
+        id: &str,
+        pid: u32,
+        pgid: u32,
+        birth_id: &str,
+    ) -> Result<(), AppError> {
+        let connection = self.connection.lock().map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0301",
+                "state lock poisoned",
+                crate::domain::ErrorKind::Database,
+            )
+        })?;
+        connection.execute(
+            "UPDATE sessions SET pid=?2, pgid=?3, birth_id=?4 WHERE id=?1",
+            params![id, pid, pgid, birth_id],
+        )?;
+        Ok(())
+    }
+
     pub fn save_checkpoint(&self, record: &CheckpointRecord) -> Result<(), AppError> {
         let connection = self.connection.lock().map_err(|_| {
             AppError::diagnostic(

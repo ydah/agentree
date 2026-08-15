@@ -7,7 +7,6 @@ use std::{
     process::{Command, Stdio},
 };
 
-use clap::error::ErrorKind as ClapErrorKind;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -43,6 +42,7 @@ impl Application {
             return Self::dispatch_shim(raw_args);
         }
         let cli = cli::parse_args(raw_args).map_err(clap_to_error)?;
+        deny_administrative_command_in_session(&cli.command)?;
         let git = GitRunner::resolve()?;
         let start = cli
             .repository
@@ -73,9 +73,9 @@ impl Application {
                 &context,
                 RunArgs {
                     task: selector,
-                    program: vec![OsString::from(
-                        std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh")),
-                    )],
+                    program: vec![
+                        std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"))
+                    ],
                     require_post_checks: false,
                 },
                 json,
@@ -121,9 +121,9 @@ impl Application {
                     &context,
                     RunArgs {
                         task: selector,
-                        program: vec![OsString::from(
-                            std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh")),
-                        )],
+                        program: vec![
+                            std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"))
+                        ],
                         require_post_checks: false,
                     },
                     json,
@@ -420,6 +420,13 @@ impl Application {
         {
             let _ = unsafe { libc::setpgid(pid as i32, pid as i32) };
         }
+        let pgid = pid;
+        context.state.update_session_identity(
+            &session_id,
+            pid,
+            pgid,
+            &process_birth_identity(pid),
+        )?;
         let status = child.wait()?;
         let exit_code = status
             .code()
@@ -489,16 +496,9 @@ impl Application {
                 ErrorKind::LockConflict,
             ));
         }
-        if !Path::new(&context.manifest.worktree_root)
-            .canonicalize()?
-            .starts_with(
-                Path::new(&record.path)
-                    .canonicalize()
-                    .unwrap_or_else(|_| record.path.clone())
-                    .parent()
-                    .unwrap_or(Path::new("/")),
-            )
-        {
+        let managed_root = Path::new(&context.manifest.worktree_root).canonicalize()?;
+        let candidate = record.path.canonicalize()?;
+        if !candidate.starts_with(&managed_root) {
             return Err(AppError::diagnostic(
                 "AGT-0712",
                 "worktree is outside the managed root",
@@ -565,6 +565,7 @@ impl Application {
                 ErrorKind::LockConflict,
             ));
         }
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
         let operation = context.state.create_operation(
             OperationKind::Archive,
             Some(&record.id),
@@ -672,7 +673,7 @@ impl Application {
             ));
         }
         let operations = context.state.incomplete_operations()?;
-        let selected = operations.into_iter().filter(|item| operation.is_none_or(|id| id == item.id)).map(|item| serde_json::json!({ "operation_id": item.id, "kind": item.kind, "status": item.status, "expected": item.expected, "observed": item.observed, "action": "inspect Git facts; no automatic rollback or deletion" })).collect::<Vec<_>>();
+        let selected = operations.into_iter().filter(|item| operation.map(|id| id == item.id).unwrap_or(true)).map(|item| serde_json::json!({ "operation_id": item.id, "kind": item.kind, "status": item.status, "expected": item.expected, "observed": item.observed, "action": "inspect Git facts; no automatic rollback or deletion" })).collect::<Vec<_>>();
         let _ = plan_fingerprint;
         output(
             json,
@@ -936,6 +937,18 @@ impl Application {
         let branch = task::branch_for(slug, &task_id)?;
         let path = task::path_for(Path::new(&context.manifest.worktree_root), slug, &task_id)?;
         let source_task = context.state.task(&source.task_id)?;
+        let record = TaskRecord {
+            id: task_id.clone(),
+            slug: slug.to_owned(),
+            branch: branch.clone(),
+            path: path.clone(),
+            base_oid: source.head_oid.clone(),
+            head_oid: source.head_oid.clone(),
+            lifecycle: Lifecycle::Creating,
+            config_hash: source_task.config_hash.clone(),
+            scopes: source_task.scopes.clone(),
+        };
+        context.state.insert_task(&record)?;
         let operation = context.state.create_operation(
             OperationKind::CreateTask,
             Some(&task_id),
@@ -957,18 +970,6 @@ impl Application {
                 OsString::from(&branch),
             ],
         )?;
-        let record = TaskRecord {
-            id: task_id.clone(),
-            slug: slug.to_owned(),
-            branch: branch.clone(),
-            path: path.clone(),
-            base_oid: source.head_oid.clone(),
-            head_oid: source.head_oid.clone(),
-            lifecycle: Lifecycle::Creating,
-            config_hash: source_task.config_hash.clone(),
-            scopes: source_task.scopes.clone(),
-        };
-        context.state.insert_task(&record)?;
         let mut env = BTreeMap::new();
         env.insert(
             OsString::from("GIT_INDEX_FILE"),
@@ -1163,6 +1164,15 @@ impl Application {
 
     fn sync(context: &Context, arguments: SyncArgs, json: bool) -> Result<i32, AppError> {
         let record = context.state.task(&arguments.task)?;
+        if arguments.r#continue || arguments.abort {
+            return Self::sync_continuation(
+                context,
+                &record,
+                arguments.r#continue,
+                arguments.abort,
+                json,
+            );
+        }
         let target = arguments.onto.ok_or_else(|| {
             AppError::diagnostic(
                 "AGT-0728",
@@ -1179,15 +1189,6 @@ impl Application {
                 OsString::from(format!("refs/heads/{target}")),
             ],
         )?;
-        if arguments.r#continue || arguments.abort {
-            return Self::sync_continuation(
-                context,
-                &record,
-                arguments.r#continue,
-                arguments.abort,
-                json,
-            );
-        }
         if record.lifecycle != Lifecycle::Active {
             return Err(AppError::diagnostic(
                 "AGT-0729",
@@ -1320,7 +1321,21 @@ impl Application {
     }
 
     fn land(context: &Context, arguments: LandArgs, json: bool) -> Result<i32, AppError> {
-        let record = context.state.task(&arguments.task)?;
+        let mut record = context.state.task(&arguments.task)?;
+        let observed_head = context.git.text(
+            &record.path,
+            InternalGitProfile::Discovery,
+            &args2(&["rev-parse", "HEAD"]),
+        )?;
+        if observed_head != record.head_oid {
+            context.state.update_task_lifecycle(
+                &record.id,
+                record.lifecycle,
+                Some(&observed_head),
+                None,
+            )?;
+            record.head_oid = observed_head;
+        }
         if arguments.into_current == arguments.onto.is_some() {
             return Err(AppError::diagnostic(
                 "AGT-0731",
@@ -1369,7 +1384,11 @@ impl Application {
         )?;
         if arguments.into_current {
             let current = repository::discover(&context.git, &std::env::current_dir()?)?;
-            if current.branch.as_deref() != Some(target.trim_start_matches("refs/heads/"))
+            let current_branch_name = current
+                .branch
+                .as_deref()
+                .map(|branch| branch.trim_start_matches("refs/heads/"));
+            if current_branch_name != Some(target.trim_start_matches("refs/heads/"))
                 || current.head != target_oid
             {
                 return Err(AppError::diagnostic(
@@ -1496,7 +1515,7 @@ impl Application {
                 ErrorKind::SessionGuardDenied,
             )
         })?;
-        if raw.iter().any(|arg| is_denied_global(arg)) {
+        if raw.iter().any(is_denied_global) {
             return Err(AppError::diagnostic(
                 "AGT-0741",
                 "Git repository override options are denied",
@@ -1663,6 +1682,27 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn process_birth_identity(pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if let Some(rest) = stat.rsplit_once(") ") {
+            if let Some(start) = rest.1.split_whitespace().nth(19) {
+                return format!("linux-starttime:{start}");
+            }
+        }
+    }
+    if let Ok(output) = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+    {
+        return format!(
+            "ps-start:{:.40}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+    "unavailable".to_owned()
+}
+
 fn create_link_or_copy(source: &Path, target: &Path) -> Result<(), AppError> {
     #[cfg(unix)]
     {
@@ -1698,6 +1738,37 @@ fn deny_inside_session() -> Result<(), AppError> {
         return Err(AppError::diagnostic(
             "AGT-0746",
             "this administrative command is denied inside a task session",
+            ErrorKind::SessionGuardDenied,
+        ));
+    }
+    Ok(())
+}
+
+fn deny_administrative_command_in_session(command: &CliCommand) -> Result<(), AppError> {
+    if std::env::var_os("AGENTREE_SESSION_ID").is_none() {
+        return Ok(());
+    }
+    let denied = matches!(
+        command,
+        CliCommand::Init
+            | CliCommand::Config { .. }
+            | CliCommand::New(_)
+            | CliCommand::Run(_)
+            | CliCommand::Shell { .. }
+            | CliCommand::Git { .. }
+            | CliCommand::Remove { .. }
+            | CliCommand::Archive { .. }
+            | CliCommand::DeleteBranch { .. }
+            | CliCommand::Doctor { .. }
+            | CliCommand::Fetch { .. }
+            | CliCommand::Sync(_)
+            | CliCommand::Resolve { .. }
+            | CliCommand::Land(_)
+    );
+    if denied {
+        return Err(AppError::diagnostic(
+            "AGT-0747",
+            "administrative Agentree command is denied inside a verified task session",
             ErrorKind::SessionGuardDenied,
         ));
     }
@@ -1817,12 +1888,5 @@ fn print_json<T: Serialize>(command: &str, result: &T) {
 }
 
 fn clap_to_error(error: clap::Error) -> AppError {
-    let kind = if error.kind() == ClapErrorKind::DisplayHelp
-        || error.kind() == ClapErrorKind::DisplayVersion
-    {
-        ErrorKind::Usage
-    } else {
-        ErrorKind::Usage
-    };
-    AppError::diagnostic("AGT-0700", error.to_string(), kind)
+    AppError::diagnostic("AGT-0700", error.to_string(), ErrorKind::Usage)
 }
