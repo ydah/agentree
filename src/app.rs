@@ -948,6 +948,15 @@ impl Application {
         json: bool,
     ) -> Result<i32, AppError> {
         let operation = context.state.operation(id)?;
+        let Some(task_id) = operation.task_id.clone() else {
+            return Err(AppError::diagnostic(
+                "AGT-0724",
+                "operation has no task scope; manual intervention required",
+                ErrorKind::RecoveryRequired,
+            ));
+        };
+        let _task_lock = task_lock(&context.manifest, &task_id)?;
+        let operation = context.state.operation(id)?;
         if doctor_fingerprint(&operation) != fingerprint {
             return Err(AppError::diagnostic(
                 "AGT-0723",
@@ -956,15 +965,7 @@ impl Application {
             ));
         }
         let expected: serde_json::Value = serde_json::from_str(&operation.expected)?;
-        let Some(task_id) = operation.task_id.as_deref() else {
-            return Err(AppError::diagnostic(
-                "AGT-0724",
-                "operation has no task scope; manual intervention required",
-                ErrorKind::RecoveryRequired,
-            ));
-        };
-        let record = context.state.task(task_id)?;
-        let _task_lock = task_lock(&context.manifest, task_id)?;
+        let record = context.state.task(&task_id)?;
         match operation.kind.as_str() {
             "checkpoint" => {
                 let observed: serde_json::Value = serde_json::from_str(&operation.observed)?;
@@ -1024,7 +1025,7 @@ impl Application {
                 }
                 if !context
                     .state
-                    .checkpoints(task_id)?
+                    .checkpoints(&task_id)?
                     .iter()
                     .any(|checkpoint| checkpoint.id == checkpoint_id)
                 {
@@ -1132,7 +1133,7 @@ impl Application {
                 }
                 context
                     .state
-                    .update_task_lifecycle(task_id, Lifecycle::Landed, None, None)?;
+                    .update_task_lifecycle(&task_id, Lifecycle::Landed, None, None)?;
                 context.state.update_operation(id, OperationStatus::Completed, &serde_json::json!({ "phase": "finalized_after_target_update", "target_oid": observed }).to_string())?;
             }
             "remove_worktree" => {
@@ -1145,7 +1146,7 @@ impl Application {
                 }
                 context
                     .state
-                    .update_task_lifecycle(task_id, Lifecycle::Archived, None, None)?;
+                    .update_task_lifecycle(&task_id, Lifecycle::Archived, None, None)?;
                 context.state.update_operation(
                     id,
                     OperationStatus::Completed,
@@ -1273,7 +1274,7 @@ impl Application {
                         }))?,
                     )?;
                 }
-                let config = match context.state.config(task_id) {
+                let config = match context.state.config(&task_id) {
                     Ok(config) => config,
                     Err(_) => {
                         let restore_from = expected["restore_from"].as_str().ok_or_else(|| {
@@ -1307,7 +1308,7 @@ impl Application {
                                 )
                             })?;
                         let source_config = context.state.config(&source_task_id)?;
-                        context.state.save_config(task_id, &source_config)?;
+                        context.state.save_config(&task_id, &source_config)?;
                         source_config
                     }
                 };
@@ -1319,7 +1320,7 @@ impl Application {
                     ));
                 }
                 context.state.update_task_lifecycle(
-                    task_id,
+                    &task_id,
                     Lifecycle::Active,
                     Some(&record.head_oid),
                     None,
