@@ -1,7 +1,9 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    thread,
+    time::Duration,
 };
 
 use serde_json::Value;
@@ -461,7 +463,12 @@ fn required_post_checks_change_run_result() {
     );
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("AGT-0750"));
-    assert!(String::from_utf8_lossy(&result.stdout).contains("required_failure"));
+    let envelope: Value = serde_json::from_slice(&result.stdout).expect("error JSON");
+    assert_eq!(envelope["ok"], false);
+    assert!(envelope["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("AGT-0750"));
 }
 
 #[test]
@@ -530,7 +537,175 @@ fn checks_enforce_timeout_and_report_the_failure() {
     let result = run(repo.path(), &["check", "timeout", "--json"]);
     assert!(!result.status.success());
     let envelope: Value = serde_json::from_slice(&result.stdout).expect("check JSON");
-    assert_eq!(envelope["result"]["results"][0]["timed_out"], true);
+    assert_eq!(envelope["ok"], false);
+    assert!(envelope["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("AGT-0726"));
+}
+
+#[test]
+fn sync_continuation_requires_an_existing_rebase() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "continuation"]).status.success());
+
+    for argument in ["--continue", "--abort"] {
+        let result = run(repo.path(), &["sync", "continuation", argument]);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("AGT-0731"));
+    }
+
+    let status = run(repo.path(), &["status", "--json"]);
+    let envelope: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(envelope["result"][0]["state"], "active");
+}
+
+#[test]
+fn oversized_check_timeout_is_rejected_without_panic() {
+    let repo = fixture();
+    fs::write(
+        repo.path().join(".agentree.toml"),
+        "[[checks]]\nname = \"huge\"\ncommand = [\"sh\", \"-c\", \"exit 0\"]\ntimeout_seconds = 9223372036854775807\nrequired = true\n",
+    )
+    .expect("config");
+    assert!(git(repo.path(), &["add", ".agentree.toml"])
+        .status
+        .success());
+    assert!(git(repo.path(), &["commit", "-qm", "config"])
+        .status
+        .success());
+    assert!(run(repo.path(), &["init"]).status.success());
+
+    let result = run(repo.path(), &["--json", "new", "huge-timeout"]);
+    assert_eq!(result.status.code(), Some(2));
+    let envelope: Value = serde_json::from_slice(&result.stdout).expect("error JSON");
+    assert_eq!(envelope["ok"], false);
+    assert!(envelope["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("AGT-0409"));
+}
+
+#[test]
+fn failed_fetch_is_terminal_and_does_not_poison_doctor() {
+    let repo = fixture();
+    assert!(git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "/private/tmp/no-such-agentree-remote"
+        ]
+    )
+    .status
+    .success());
+    assert!(run(repo.path(), &["init"]).status.success());
+
+    let result = run(repo.path(), &["fetch", "--remote", "origin"]);
+    assert!(!result.status.success());
+    let doctor = run(repo.path(), &["doctor", "--json"]);
+    let envelope: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    assert!(envelope["result"]["operations"]
+        .as_array()
+        .expect("operations")
+        .is_empty());
+}
+
+#[test]
+fn legacy_state_is_migrated_before_session_use() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    let database = repo.path().join(".git/agentree/state.sqlite3");
+    let connection = rusqlite::Connection::open(&database).expect("state database");
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             ALTER TABLE sessions RENAME TO sessions_legacy;
+             CREATE TABLE sessions(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), status TEXT NOT NULL, pid INTEGER, pgid INTEGER, exit_code INTEGER, started_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), finished_at INTEGER);
+             DROP TABLE sessions_legacy;
+             UPDATE schema_meta SET version=0 WHERE id=1;
+             PRAGMA foreign_keys=ON;",
+        )
+        .expect("legacy schema");
+    assert!(run(repo.path(), &["new", "migrated"]).status.success());
+    let result = run(
+        repo.path(),
+        &["run", "migrated", "--", "sh", "-c", "exit 0"],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let version: i64 = connection
+        .query_row("SELECT version FROM schema_meta WHERE id=1", [], |row| {
+            row.get(0)
+        })
+        .expect("schema version");
+    assert_eq!(version, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reconciles_a_supervisor_orphan() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "orphaned"]).status.success());
+    let child_file = repo.path().join("child.pid");
+    let script = format!("echo $$ > {}; sleep 5", child_file.display());
+    let mut supervisor = Command::new(env!("CARGO_BIN_EXE_agentree"))
+        .arg("--repository")
+        .arg(repo.path())
+        .args(["run", "orphaned", "--", "sh", "-c", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("supervisor");
+    for _ in 0..50 {
+        if child_file.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child_file.exists(), "child did not start");
+    unsafe {
+        libc::kill(supervisor.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = supervisor.wait();
+    thread::sleep(Duration::from_millis(100));
+
+    let doctor = run(repo.path(), &["doctor", "--json"]);
+    let envelope: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    let session = &envelope["result"]["sessions"][0];
+    assert_eq!(session["state"], "orphaned");
+    let session_id = session["session_id"].as_str().expect("session id");
+    let fingerprint = session["plan_fingerprint"].as_str().expect("fingerprint");
+    let applied = run(
+        repo.path(),
+        &[
+            "doctor",
+            "--session",
+            session_id,
+            "--apply",
+            "--plan-fingerprint",
+            fingerprint,
+        ],
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let status = run(repo.path(), &["status", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(status["result"][0]["session"], 0);
+    let retry = run(
+        repo.path(),
+        &["run", "orphaned", "--", "sh", "-c", "exit 0"],
+    );
+    assert!(retry.status.success());
 }
 
 #[test]

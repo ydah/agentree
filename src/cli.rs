@@ -58,6 +58,8 @@ pub enum Command {
         #[arg(long)]
         operation: Option<String>,
         #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
         plan: bool,
         #[arg(long)]
         apply: bool,

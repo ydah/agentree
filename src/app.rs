@@ -29,7 +29,7 @@ use crate::{
     git::{args, GitRunner},
     lock::FileLock,
     repository::{self, RepositoryFacts, RepositoryManifest},
-    state::{CheckRunRecord, CheckpointRecord, State, TaskRecord},
+    state::{CheckRunRecord, CheckpointRecord, SessionRecord, State, TaskRecord},
     task,
 };
 
@@ -47,7 +47,29 @@ impl Application {
         if cli::is_git_shim(&raw_args) {
             return Self::dispatch_shim(raw_args);
         }
-        let cli = cli::parse_args(raw_args).map_err(clap_to_error)?;
+        let json_requested = raw_args.iter().any(|arg| arg == "--json");
+        let cli = match cli::parse_args(raw_args) {
+            Ok(cli) => cli,
+            Err(error) => {
+                let error = clap_to_error(error);
+                if json_requested {
+                    print_error_json("unknown", &error);
+                }
+                return Err(error);
+            }
+        };
+        let json = cli.json;
+        let command = command_name(&cli.command);
+        let result = Self::dispatch_cli(cli);
+        if let Err(error) = &result {
+            if json {
+                print_error_json(command, error);
+            }
+        }
+        result
+    }
+
+    fn dispatch_cli(cli: cli::Cli) -> Result<i32, AppError> {
         let git = GitRunner::resolve()?;
         let start = cli
             .repository
@@ -98,12 +120,14 @@ impl Application {
             } => Self::delete_branch(&context, &selector, yes, json),
             CliCommand::Doctor {
                 operation,
+                session,
                 plan,
                 apply,
                 plan_fingerprint,
             } => Self::doctor(
                 &context,
                 operation.as_deref(),
+                session.as_deref(),
                 plan,
                 apply,
                 plan_fingerprint.as_deref(),
@@ -456,7 +480,12 @@ impl Application {
         }
         refresh_head(context, &mut record)?;
         task::facts_match(&context.git, &record)?;
-        let session_id = context.state.start_session(&record.id, 0, 0)?;
+        let supervisor_pid = std::process::id();
+        let supervisor_birth_id = process_birth_identity(supervisor_pid);
+        let session_id =
+            context
+                .state
+                .start_session(&record.id, supervisor_pid, &supervisor_birth_id)?;
         let mut child = match spawn_session_child(context, &record, &arguments, &session_id) {
             Ok(child) => child,
             Err(error) => {
@@ -546,9 +575,6 @@ impl Application {
             "post_run_checkpoint": checkpoint,
             "post_checks": post_checks,
         });
-        if json {
-            print_json("run", &result);
-        }
         if arguments.require_post_checks {
             if let Some(error) = post_processing_error {
                 return Err(AppError::diagnostic(
@@ -557,6 +583,9 @@ impl Application {
                     ErrorKind::StateInconsistent,
                 ));
             }
+        }
+        if json {
+            print_json("run", &result);
         }
         Ok(exit_code.unwrap_or(1))
     }
@@ -807,19 +836,37 @@ impl Application {
     fn doctor(
         context: &Context,
         operation: Option<&str>,
+        session: Option<&str>,
         plan: bool,
         apply: bool,
         plan_fingerprint: Option<&str>,
         json: bool,
     ) -> Result<i32, AppError> {
-        if plan && operation.is_none() {
+        if operation.is_some() && session.is_some() {
+            return Err(AppError::diagnostic(
+                "AGT-0756",
+                "doctor accepts either --operation or --session, not both",
+                ErrorKind::Usage,
+            ));
+        }
+        if plan && operation.is_none() && session.is_none() {
             return Err(AppError::diagnostic(
                 "AGT-0755",
-                "doctor --plan requires --operation",
+                "doctor --plan requires --operation or --session",
                 ErrorKind::Usage,
             ));
         }
         if apply {
+            if let Some(session_id) = session {
+                let fingerprint = plan_fingerprint.ok_or_else(|| {
+                    AppError::diagnostic(
+                        "AGT-0722",
+                        "doctor --apply requires --plan-fingerprint",
+                        ErrorKind::Usage,
+                    )
+                })?;
+                return Self::apply_session_plan(context, session_id, fingerprint, json);
+            }
             let id = operation.ok_or_else(|| {
                 AppError::diagnostic(
                     "AGT-0719",
@@ -841,11 +888,56 @@ impl Application {
             let fingerprint = doctor_fingerprint(&item);
             serde_json::json!({ "operation_id": item.id, "kind": item.kind, "status": item.status, "expected": item.expected, "observed": item.observed, "plan_fingerprint": fingerprint, "action": "inspect Git facts; no automatic rollback or deletion" })
         }).collect::<Vec<_>>();
+        let sessions = context
+            .state
+            .active_sessions()?
+            .into_iter()
+            .filter(|item| session.map(|id| id == item.id).unwrap_or(true))
+            .map(|item| session_plan(&item))
+            .collect::<Result<Vec<_>, _>>()?;
         output(
             json,
             "doctor",
             None,
-            &serde_json::json!({ "read_only": true, "operations": selected }),
+            &serde_json::json!({ "read_only": true, "operations": selected, "sessions": sessions }),
+        )
+    }
+
+    fn apply_session_plan(
+        context: &Context,
+        id: &str,
+        fingerprint: &str,
+        json: bool,
+    ) -> Result<i32, AppError> {
+        let session = context.state.session(id)?;
+        let _task_lock = task_lock(&context.manifest, &session.task_id)?;
+        let plan = session_plan(&session)?;
+        if plan["plan_fingerprint"].as_str() != Some(fingerprint) {
+            return Err(AppError::diagnostic(
+                "AGT-0723",
+                "doctor session plan fingerprint is stale",
+                ErrorKind::RecoveryRequired,
+            ));
+        }
+        if plan["state"] != "orphaned" {
+            return Err(AppError::diagnostic(
+                "AGT-0761",
+                "session is not a verified orphan; no process will be signaled",
+                ErrorKind::RecoveryRequired,
+            ));
+        }
+        let terminated = terminate_orphaned_session(&session);
+        context.state.finish_session(id, "orphaned", None)?;
+        output(
+            json,
+            "doctor",
+            None,
+            &serde_json::json!({
+                "applied": true,
+                "session_id": id,
+                "state": "orphaned",
+                "child_signal_attempted": terminated,
+            }),
         )
     }
 
@@ -1831,12 +1923,6 @@ impl Application {
     fn check(context: &Context, selector: &str, json: bool) -> Result<i32, AppError> {
         let record = context.state.task(selector)?;
         let (results, required_failure) = Self::execute_checks(context, &record.id)?;
-        output(
-            json,
-            "check",
-            None,
-            &serde_json::json!({ "task_id": record.id, "results": results }),
-        )?;
         if required_failure {
             return Err(AppError::diagnostic(
                 "AGT-0726",
@@ -1844,7 +1930,12 @@ impl Application {
                 ErrorKind::StateInconsistent,
             ));
         }
-        Ok(0)
+        output(
+            json,
+            "check",
+            None,
+            &serde_json::json!({ "task_id": record.id, "results": results }),
+        )
     }
 
     fn execute_checks(
@@ -1967,9 +2058,18 @@ impl Application {
             OsString::from(remote),
             OsString::from(refspec),
         ];
-        context
+        if let Err(error) = context
             .git
-            .run(&context.facts.root, InternalGitProfile::Fetch, &args)?;
+            .run(&context.facts.root, InternalGitProfile::Fetch, &args)
+        {
+            let _ = context.state.update_operation(
+                &operation.id,
+                OperationStatus::Failed,
+                &serde_json::json!({ "phase": "fetch_failed", "error": error.to_string() })
+                    .to_string(),
+            );
+            return Err(error);
+        }
         let refs_after = ref_snapshot(&context.git, &context.facts.root)?;
         let allowed_prefix = format!("refs/remotes/{remote}/");
         let mut changed_refs = Vec::new();
@@ -2130,13 +2230,44 @@ impl Application {
         abort: bool,
         json: bool,
     ) -> Result<i32, AppError> {
-        if !continue_rebase && !abort {
+        if continue_rebase == abort {
             return Err(AppError::diagnostic(
                 "AGT-0730",
-                "choose --continue or --abort",
+                "choose exactly one of --continue or --abort",
                 ErrorKind::Usage,
             ));
         }
+        if !matches!(record.lifecycle, Lifecycle::Active | Lifecycle::Conflicted) {
+            return Err(AppError::diagnostic(
+                "AGT-0729",
+                "sync continuation requires an active or conflicted task",
+                ErrorKind::StateInconsistent,
+            ));
+        }
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
+        task::facts_match(&context.git, record)?;
+        if !rebase_in_progress(&context.git, &record.path)? {
+            return Err(AppError::diagnostic(
+                "AGT-0731",
+                "no rebase is in progress for this task",
+                ErrorKind::StateInconsistent,
+            ));
+        }
+        let operation = context
+            .state
+            .incomplete_operation_for_task_kind(&record.id, OperationKind::Sync.as_str())?
+            .ok_or_else(|| {
+                AppError::diagnostic(
+                    "AGT-0732",
+                    "rebase continuation has no incomplete sync operation",
+                    ErrorKind::RecoveryRequired,
+                )
+            })?;
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Executing,
+            &serde_json::json!({ "phase": "continuation_started" }).to_string(),
+        )?;
         let command = if continue_rebase {
             "--continue"
         } else {
@@ -2160,20 +2291,30 @@ impl Application {
                     Some(&head),
                     None,
                 )?;
+                context.state.update_operation(
+                    &operation.id,
+                    OperationStatus::Completed,
+                    &serde_json::json!({ "phase": if continue_rebase { "rebase_continued" } else { "rebase_aborted" }, "head": head }).to_string(),
+                )?;
                 output(
                     json,
                     "sync",
-                    None,
+                    Some(&operation.id),
                     &serde_json::json!({ "task_id": record.id, "phase": command, "head_oid": head }),
                 )
             }
             Err(error) => {
-                context.state.update_task_lifecycle(
+                let _ = context.state.update_task_lifecycle(
                     &record.id,
                     Lifecycle::Conflicted,
                     None,
                     None,
-                )?;
+                );
+                let _ = context.state.update_operation(
+                    &operation.id,
+                    OperationStatus::ManualIntervention,
+                    &serde_json::json!({ "phase": "continuation_conflicted", "error": error.to_string() }).to_string(),
+                );
                 Err(error)
             }
         }
@@ -2602,6 +2743,12 @@ fn current_branch(git: &GitRunner, root: &Path) -> Result<String, AppError> {
     Ok(branch.trim_start_matches("refs/heads/").to_owned())
 }
 
+fn rebase_in_progress(git: &GitRunner, worktree: &Path) -> Result<bool, AppError> {
+    let merge_dir = resolve_git_path(git, worktree, "rebase-merge")?;
+    let apply_dir = resolve_git_path(git, worktree, "rebase-apply")?;
+    Ok(merge_dir.exists() || apply_dir.exists())
+}
+
 fn sha256_file(path: &Path) -> Result<String, AppError> {
     let bytes = fs::read(path)?;
     let mut hasher = Sha256::new();
@@ -2681,6 +2828,113 @@ fn process_birth_identity(pid: u32) -> String {
         );
     }
     "unavailable".to_owned()
+}
+
+fn session_plan(session: &SessionRecord) -> Result<serde_json::Value, AppError> {
+    let state = classify_session(session);
+    let action = match state {
+        "active" => "leave session untouched",
+        "orphaned" if child_identity_verified(session) => {
+            "mark orphaned and signal the verified child process group"
+        }
+        "orphaned" => "mark orphaned without signaling an unverified child process",
+        _ => "manual intervention; process identity is inconclusive",
+    };
+    let fingerprint = hash_json(&serde_json::json!({
+        "session_id": session.id,
+        "task_id": session.task_id,
+        "status": session.status,
+        "pid": session.pid,
+        "pgid": session.pgid,
+        "birth_id": session.birth_id,
+        "supervisor_pid": session.supervisor_pid,
+        "supervisor_birth_id": session.supervisor_birth_id,
+        "state": state,
+    }))?;
+    Ok(serde_json::json!({
+        "session_id": session.id,
+        "task_id": session.task_id,
+        "status": session.status,
+        "pid": session.pid,
+        "pgid": session.pgid,
+        "supervisor_pid": session.supervisor_pid,
+        "state": state,
+        "action": action,
+        "plan_fingerprint": fingerprint,
+    }))
+}
+
+fn child_identity_verified(session: &SessionRecord) -> bool {
+    let (Some(pid), Some(expected)) = (session.pid, session.birth_id.as_deref()) else {
+        return false;
+    };
+    expected != "unavailable" && process_birth_identity(pid) == expected
+}
+
+fn classify_session(session: &SessionRecord) -> &'static str {
+    let Some(supervisor_pid) = session.supervisor_pid else {
+        return "orphaned";
+    };
+    if !process_exists(supervisor_pid) {
+        return "orphaned";
+    }
+    let Some(expected) = session.supervisor_birth_id.as_deref() else {
+        return "unknown";
+    };
+    if expected == "unavailable" {
+        return "unknown";
+    }
+    if process_birth_identity(supervisor_pid) == expected {
+        "active"
+    } else {
+        "orphaned"
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn terminate_orphaned_session(session: &SessionRecord) -> bool {
+    let Some(pid) = session.pid else {
+        return false;
+    };
+    if !child_identity_verified(session) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let pgid = session.pgid.unwrap_or_default();
+        let current_pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        if pgid > 1 && current_pgid == pgid as libc::pid_t {
+            unsafe {
+                libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+            }
+            true
+        } else {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            true
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session;
+        false
+    }
 }
 
 fn spawn_session_child(
@@ -2806,7 +3060,15 @@ fn run_bounded_check(
     let output_limit = definition.output_limit_bytes;
     let stdout_handle = thread::spawn(move || read_limited(stdout, output_limit, stdout_limited));
     let stderr_handle = thread::spawn(move || read_limited(stderr, output_limit, stderr_limited));
-    let deadline = Instant::now() + Duration::from_secs(definition.timeout_seconds);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(definition.timeout_seconds))
+        .ok_or_else(|| {
+            AppError::diagnostic(
+                "AGT-0755",
+                "check timeout cannot be represented by the system clock",
+                ErrorKind::Usage,
+            )
+        })?;
     let mut timed_out = false;
     let status = loop {
         if output_limited.load(Ordering::Acquire) {
@@ -3050,6 +3312,45 @@ fn policy_decision(arguments: &[OsString]) -> Result<bool, AppError> {
         return Ok(!message_value);
     }
     Ok(false)
+}
+
+fn command_name(command: &CliCommand) -> &'static str {
+    match command {
+        CliCommand::Init => "init",
+        CliCommand::Config { .. } => "config",
+        CliCommand::New(_) => "new",
+        CliCommand::Status => "status",
+        CliCommand::Context { .. } => "context",
+        CliCommand::Diff { .. } => "diff",
+        CliCommand::Run(_) => "run",
+        CliCommand::Shell { .. } => "shell",
+        CliCommand::Git { .. } => "git",
+        CliCommand::Remove { .. } => "remove",
+        CliCommand::Archive { .. } => "archive",
+        CliCommand::DeleteBranch { .. } => "delete-branch",
+        CliCommand::Doctor { .. } => "doctor",
+        CliCommand::Checkpoint { .. } => "checkpoint",
+        CliCommand::Overlap(_) => "overlap",
+        CliCommand::Check { .. } => "check",
+        CliCommand::Fetch { .. } => "fetch",
+        CliCommand::Sync(_) => "sync",
+        CliCommand::Resolve { .. } => "resolve",
+        CliCommand::Land(_) => "land",
+    }
+}
+
+fn print_error_json(command: &str, error: &AppError) {
+    let envelope = JsonEnvelope::<serde_json::Value> {
+        schema_version: 1,
+        ok: false,
+        command: command.to_owned(),
+        operation_id: None,
+        result: None,
+        error: Some(error.render()),
+    };
+    if let Ok(value) = serde_json::to_string_pretty(&envelope) {
+        println!("{value}");
+    }
 }
 
 fn output<T: Serialize>(

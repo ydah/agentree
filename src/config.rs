@@ -36,6 +36,9 @@ fn default_check_output_limit_bytes() -> usize {
     8 * 1024 * 1024
 }
 
+const MAX_CHECK_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
+const MAX_CHECK_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn snapshot(git: &GitRunner, root: &Path, base_oid: &str) -> Result<ConfigSnapshot, AppError> {
     let raw = match git.run(
         root,
@@ -131,25 +134,37 @@ fn parse_checks(value: Option<&serde_json::Value>) -> Result<Vec<CheckDefinition
                     ErrorKind::Usage,
                 ));
             }
-            let timeout_seconds = object
-                .get("timeout_seconds")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(default_check_timeout_seconds() as i64);
-            if timeout_seconds <= 0 {
+            let timeout_seconds = match object.get("timeout_seconds") {
+                Some(value) => value.as_u64().ok_or_else(|| {
+                    AppError::diagnostic(
+                        "AGT-0409",
+                        "check.timeout_seconds must be an integer",
+                        ErrorKind::Usage,
+                    )
+                })?,
+                None => default_check_timeout_seconds(),
+            };
+            if timeout_seconds == 0 || timeout_seconds > MAX_CHECK_TIMEOUT_SECONDS {
                 return Err(AppError::diagnostic(
                     "AGT-0409",
-                    "check.timeout_seconds must be positive",
+                    format!("check.timeout_seconds must be between 1 and {MAX_CHECK_TIMEOUT_SECONDS}"),
                     ErrorKind::Usage,
                 ));
             }
-            let output_limit_bytes = object
-                .get("output_limit_bytes")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(default_check_output_limit_bytes() as i64);
-            if output_limit_bytes <= 0 {
+            let output_limit_bytes = match object.get("output_limit_bytes") {
+                Some(value) => value.as_u64().ok_or_else(|| {
+                    AppError::diagnostic(
+                        "AGT-0410",
+                        "check.output_limit_bytes must be an integer",
+                        ErrorKind::Usage,
+                    )
+                })?,
+                None => default_check_output_limit_bytes() as u64,
+            };
+            if output_limit_bytes == 0 || output_limit_bytes > MAX_CHECK_OUTPUT_LIMIT_BYTES {
                 return Err(AppError::diagnostic(
                     "AGT-0410",
-                    "check.output_limit_bytes must be positive",
+                    format!("check.output_limit_bytes must be between 1 and {MAX_CHECK_OUTPUT_LIMIT_BYTES}"),
                     ErrorKind::Usage,
                 ));
             }
@@ -160,8 +175,14 @@ fn parse_checks(value: Option<&serde_json::Value>) -> Result<Vec<CheckDefinition
                     .get("required")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
-                timeout_seconds: timeout_seconds as u64,
-                output_limit_bytes: output_limit_bytes as usize,
+                timeout_seconds,
+                output_limit_bytes: usize::try_from(output_limit_bytes).map_err(|_| {
+                    AppError::diagnostic(
+                        "AGT-0411",
+                        "check.output_limit_bytes is too large for this platform",
+                        ErrorKind::Usage,
+                    )
+                })?,
             })
         })
         .collect()

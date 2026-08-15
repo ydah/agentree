@@ -3,7 +3,7 @@ use std::{
     sync::Mutex,
 };
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::domain::{AppError, Id, Lifecycle, OperationKind, OperationStatus};
 
@@ -30,26 +30,37 @@ pub struct OperationRecord {
     pub observed: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub id: String,
+    pub task_id: String,
+    pub status: String,
+    pub pid: Option<u32>,
+    pub pgid: Option<u32>,
+    pub birth_id: Option<String>,
+    pub supervisor_pid: Option<u32>,
+    pub supervisor_birth_id: Option<String>,
+}
+
 pub struct State {
     pub path: PathBuf,
     connection: Mutex<Connection>,
 }
 
 impl State {
+    const CURRENT_SCHEMA_VERSION: i64 = 2;
+
     pub fn open(path: &Path) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(SCHEMA)?;
-        connection.execute(
-            "INSERT OR IGNORE INTO schema_meta(id, version) VALUES(1, 1)",
-            [],
-        )?;
+        migrate(&mut connection)?;
         Ok(Self {
             path: path.to_path_buf(),
             connection: Mutex::new(connection),
@@ -63,18 +74,20 @@ impl State {
         expected: &str,
     ) -> Result<OperationRecord, AppError> {
         let id = Id::new("op-");
-        let connection = self.connection.lock().map_err(|_| {
+        let mut connection = self.connection.lock().map_err(|_| {
             AppError::diagnostic(
                 "AGT-0301",
                 "state lock poisoned",
                 crate::domain::ErrorKind::Database,
             )
         })?;
-        connection.execute("INSERT INTO operations(id, kind, status, task_id, expected_json, observed_json) VALUES(?1, ?2, ?3, ?4, ?5, '{}')", params![id.0, kind.as_str(), OperationStatus::Prepared.as_str(), task_id, expected])?;
-        connection.execute(
+        let transaction = connection.transaction()?;
+        transaction.execute("INSERT INTO operations(id, kind, status, task_id, expected_json, observed_json) VALUES(?1, ?2, ?3, ?4, ?5, '{}')", params![id.0, kind.as_str(), OperationStatus::Prepared.as_str(), task_id, expected])?;
+        transaction.execute(
             "INSERT INTO operation_steps(operation_id, from_status, to_status, observed_json) VALUES(?1, NULL, ?2, '{}')",
             params![id.0, OperationStatus::Prepared.as_str()],
         )?;
+        transaction.commit()?;
         Ok(OperationRecord {
             id: id.0,
             kind: kind.as_str().to_owned(),
@@ -91,14 +104,15 @@ impl State {
         status: OperationStatus,
         observed: &str,
     ) -> Result<(), AppError> {
-        let connection = self.connection.lock().map_err(|_| {
+        let mut connection = self.connection.lock().map_err(|_| {
             AppError::diagnostic(
                 "AGT-0301",
                 "state lock poisoned",
                 crate::domain::ErrorKind::Database,
             )
         })?;
-        let from_status: String = connection
+        let transaction = connection.transaction()?;
+        let from_status: String = transaction
             .query_row(
                 "SELECT status FROM operations WHERE id=?1",
                 params![id],
@@ -112,7 +126,7 @@ impl State {
                     crate::domain::ErrorKind::RecoveryRequired,
                 )
             })?;
-        let changed = connection.execute(
+        let changed = transaction.execute(
             "UPDATE operations SET status=?2, observed_json=?3, updated_at=strftime('%s','now') WHERE id=?1 AND status=?4 AND status NOT IN ('completed','failed')",
             params![id, status.as_str(), observed, from_status],
         )?;
@@ -123,10 +137,11 @@ impl State {
                 crate::domain::ErrorKind::RecoveryRequired,
             ));
         }
-        connection.execute(
+        transaction.execute(
             "INSERT INTO operation_steps(operation_id, from_status, to_status, observed_json) VALUES(?1, ?2, ?3, ?4)",
             params![id, from_status, status.as_str(), observed],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -166,6 +181,40 @@ impl State {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    pub fn incomplete_operation_for_task_kind(
+        &self,
+        task_id: &str,
+        kind: &str,
+    ) -> Result<Option<OperationRecord>, AppError> {
+        let connection = self.connection.lock().map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0301",
+                "state lock poisoned",
+                crate::domain::ErrorKind::Database,
+            )
+        })?;
+        connection
+            .query_row(
+                "SELECT id, kind, status, task_id, expected_json, observed_json
+                 FROM operations
+                 WHERE task_id=?1 AND kind=?2 AND status NOT IN ('completed','failed')
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![task_id, kind],
+                |row| {
+                    Ok(OperationRecord {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        status: row.get(2)?,
+                        task_id: row.get(3)?,
+                        expected: row.get(4)?,
+                        observed: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(AppError::from)
     }
 
     pub fn operation(&self, id: &str) -> Result<OperationRecord, AppError> {
@@ -357,7 +406,53 @@ impl State {
             .map_err(AppError::from)
     }
 
-    pub fn start_session(&self, task_id: &str, pid: u32, pgid: u32) -> Result<String, AppError> {
+    pub fn active_sessions(&self) -> Result<Vec<SessionRecord>, AppError> {
+        let connection = self.connection.lock().map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0301",
+                "state lock poisoned",
+                crate::domain::ErrorKind::Database,
+            )
+        })?;
+        let mut statement = connection.prepare(
+            "SELECT id, task_id, status, pid, pgid, birth_id, supervisor_pid, supervisor_birth_id
+             FROM sessions WHERE status IN ('starting','running') ORDER BY started_at",
+        )?;
+        let rows = statement.query_map([], session_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn session(&self, id: &str) -> Result<SessionRecord, AppError> {
+        let connection = self.connection.lock().map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0301",
+                "state lock poisoned",
+                crate::domain::ErrorKind::Database,
+            )
+        })?;
+        connection
+            .query_row(
+                "SELECT id, task_id, status, pid, pgid, birth_id, supervisor_pid, supervisor_birth_id
+                 FROM sessions WHERE id=?1",
+                params![id],
+                session_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AppError::diagnostic(
+                    "AGT-0306",
+                    "session not found",
+                    crate::domain::ErrorKind::Usage,
+                )
+            })
+    }
+
+    pub fn start_session(
+        &self,
+        task_id: &str,
+        supervisor_pid: u32,
+        supervisor_birth_id: &str,
+    ) -> Result<String, AppError> {
         let id = Id::new("session-");
         let connection = self.connection.lock().map_err(|_| {
             AppError::diagnostic(
@@ -367,8 +462,9 @@ impl State {
             )
         })?;
         connection.execute(
-            "INSERT INTO sessions(id, task_id, status, pid, pgid) VALUES(?1,?2,'running',?3,?4)",
-            params![id.0, task_id, pid, pgid],
+            "INSERT INTO sessions(id, task_id, status, supervisor_pid, supervisor_birth_id)
+             VALUES(?1,?2,'starting',?3,?4)",
+            params![id.0, task_id, supervisor_pid, supervisor_birth_id],
         )?;
         Ok(id.0)
     }
@@ -405,7 +501,7 @@ impl State {
             )
         })?;
         connection.execute(
-            "UPDATE sessions SET pid=?2, pgid=?3, birth_id=?4 WHERE id=?1",
+            "UPDATE sessions SET status='running', pid=?2, pgid=?3, birth_id=?4 WHERE id=?1",
             params![id, pid, pgid, birth_id],
         )?;
         Ok(())
@@ -507,13 +603,82 @@ CREATE TABLE IF NOT EXISTS schema_meta(id INTEGER PRIMARY KEY CHECK(id=1), versi
 CREATE TABLE IF NOT EXISTS repositories(id TEXT PRIMARY KEY, common_dir TEXT NOT NULL, state_dir TEXT NOT NULL, object_format TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, slug TEXT NOT NULL, branch_ref TEXT NOT NULL UNIQUE, worktree_path TEXT NOT NULL UNIQUE, base_oid TEXT NOT NULL, head_oid TEXT NOT NULL, lifecycle TEXT NOT NULL, config_hash TEXT NOT NULL, scopes_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS configs(task_id TEXT PRIMARY KEY REFERENCES tasks(id), hash TEXT NOT NULL, source_oid TEXT NOT NULL, snapshot_json TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), status TEXT NOT NULL, pid INTEGER, pgid INTEGER, birth_id TEXT, exit_code INTEGER, started_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), finished_at INTEGER);
+CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), status TEXT NOT NULL, pid INTEGER, pgid INTEGER, birth_id TEXT, supervisor_pid INTEGER, supervisor_birth_id TEXT, exit_code INTEGER, started_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), finished_at INTEGER);
 CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL, task_id TEXT REFERENCES tasks(id), expected_json TEXT NOT NULL, observed_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS operation_steps(id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL REFERENCES operations(id), from_status TEXT, to_status TEXT NOT NULL, observed_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS checkpoints(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), head_oid TEXT NOT NULL, index_tree_oid TEXT NOT NULL, worktree_tree_oid TEXT NOT NULL, metadata_oid TEXT NOT NULL, message TEXT, config_hash TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS check_runs(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), head_oid TEXT NOT NULL, config_hash TEXT NOT NULL, definition_hash TEXT NOT NULL, status TEXT NOT NULL, command_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 "#;
+
+fn migrate(connection: &mut Connection) -> Result<(), AppError> {
+    let version = connection
+        .query_row("SELECT version FROM schema_meta WHERE id=1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?
+        .unwrap_or(0);
+    if version > State::CURRENT_SCHEMA_VERSION {
+        return Err(AppError::diagnostic(
+            "AGT-0310",
+            format!(
+                "state schema version {version} is newer than supported version {}",
+                State::CURRENT_SCHEMA_VERSION
+            ),
+            crate::domain::ErrorKind::Unsupported,
+        ));
+    }
+
+    let transaction = connection.transaction()?;
+    ensure_column(&transaction, "sessions", "birth_id", "TEXT")?;
+    ensure_column(&transaction, "sessions", "supervisor_pid", "INTEGER")?;
+    ensure_column(&transaction, "sessions", "supervisor_birth_id", "TEXT")?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_meta(id, version) VALUES(1, ?1)",
+        params![State::CURRENT_SCHEMA_VERSION],
+    )?;
+    transaction.execute(
+        "UPDATE schema_meta SET version=?1 WHERE id=1",
+        params![State::CURRENT_SCHEMA_VERSION],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), AppError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    if columns
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == column)
+    {
+        return Ok(());
+    }
+    connection.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
+}
+
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        status: row.get(2)?,
+        pid: row.get(3)?,
+        pgid: row.get(4)?,
+        birth_id: row.get(5)?,
+        supervisor_pid: row.get(6)?,
+        supervisor_birth_id: row.get(7)?,
+    })
+}
 
 fn path_text(path: &Path) -> Result<String, AppError> {
     path.to_str().map(str::to_owned).ok_or_else(|| {
