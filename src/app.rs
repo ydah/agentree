@@ -2036,6 +2036,17 @@ impl Application {
                 OsString::from(remote),
             ],
         )?;
+        context.git.require_options(
+            &context.facts.root,
+            InternalGitProfile::Fetch,
+            "fetch",
+            &[
+                "--[no-]prune",
+                "--[no-]tags",
+                "--[no-]recurse-submodules",
+                "--[no-]write-fetch-head",
+            ],
+        )?;
         let operation = context.state.create_operation(
             OperationKind::Fetch,
             None,
@@ -2154,6 +2165,12 @@ impl Application {
                 ErrorKind::StateInconsistent,
             ));
         }
+        context.git.require_options(
+            &record.path,
+            InternalGitProfile::Sync,
+            "rebase",
+            &["--[no-]update-refs", "--[no-]autostash"],
+        )?;
         let _task_lock = task_lock(&context.manifest, &record.id)?;
         refresh_head(context, &mut record)?;
         let facts = task_facts(&context.git, &record, &context.facts)?;

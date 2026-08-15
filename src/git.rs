@@ -60,6 +60,43 @@ impl GitRunner {
         Ok(())
     }
 
+    pub fn require_options(
+        &self,
+        cwd: &Path,
+        profile: InternalGitProfile,
+        command_name: &str,
+        options: &[&str],
+    ) -> Result<(), AppError> {
+        let mut command = Command::new(&self.executable);
+        command.current_dir(cwd);
+        command.args(self.profile_args(profile));
+        command.args([OsString::from(command_name), OsString::from("-h")]);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        sanitize_git_environment(&mut command);
+        let output = command.output()?;
+        let mut help = output.stdout;
+        help.extend(output.stderr);
+        let help = String::from_utf8_lossy(&help);
+        let missing = options
+            .iter()
+            .filter(|option| !help.contains(**option))
+            .copied()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(AppError::diagnostic(
+            "AGT-0210",
+            format!(
+                "Git {command_name} lacks required capabilities: {}",
+                missing.join(", ")
+            ),
+            crate::domain::ErrorKind::Unsupported,
+        ))
+    }
+
     pub fn run(
         &self,
         cwd: &Path,
