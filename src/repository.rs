@@ -211,7 +211,12 @@ fn canonical(path: PathBuf) -> Result<PathBuf, AppError> {
 }
 fn repository_id(common_dir: &Path) -> String {
     let mut hash = Sha256::new();
-    hash.update(common_dir.as_os_str().to_string_lossy().as_bytes());
+    hash.update(
+        common_dir
+            .to_str()
+            .unwrap_or("<unsupported-path>")
+            .as_bytes(),
+    );
     format!("repo-{:x}", hash.finalize())
 }
 fn now() -> u64 {

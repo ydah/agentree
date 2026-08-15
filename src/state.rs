@@ -127,7 +127,7 @@ impl State {
                 crate::domain::ErrorKind::Database,
             )
         })?;
-        connection.execute("INSERT INTO tasks(id, slug, branch_ref, worktree_path, base_oid, head_oid, lifecycle, config_hash, scopes_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![task.id, task.slug, task.branch, task.path.to_string_lossy().to_string(), task.base_oid, task.head_oid, task.lifecycle.as_str(), task.config_hash, serde_json::to_string(&task.scopes)?])?;
+        connection.execute("INSERT INTO tasks(id, slug, branch_ref, worktree_path, base_oid, head_oid, lifecycle, config_hash, scopes_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![task.id, task.slug, task.branch, path_text(&task.path)?, task.base_oid, task.head_oid, task.lifecycle.as_str(), task.config_hash, serde_json::to_string(&task.scopes)?])?;
         Ok(())
     }
 

@@ -212,11 +212,7 @@ impl Application {
         let branch_status = context.git.run(
             &context.facts.root,
             InternalGitProfile::WorktreeManagement,
-            &[
-                OsString::from("branch"),
-                OsString::from(&branch),
-                OsString::from(&base_oid),
-            ],
+            &args2(&["update-ref", &branch, &base_oid]),
         );
         if let Err(error) = branch_status {
             let _ = context.state.update_operation(
@@ -238,7 +234,7 @@ impl Application {
                 OsString::from("worktree"),
                 OsString::from("add"),
                 path.as_os_str().to_owned(),
-                OsString::from(&branch),
+                OsString::from(branch.trim_start_matches("refs/heads/")),
             ],
         );
         if let Err(error) = add_result {
@@ -770,6 +766,7 @@ impl Application {
             Some(&record.id),
             &serde_json::json!({ "head": record.head_oid, "index": facts.index_path }).to_string(),
         )?;
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
         let tmp_root = PathBuf::from(&context.manifest.state_dir).join("tmp");
         fs::create_dir_all(&tmp_root)?;
         let frozen = tmp_root.join(format!("index-{}", operation.id));
@@ -955,10 +952,11 @@ impl Application {
             &serde_json::json!({ "restore_from": checkpoint_id, "base_oid": source.head_oid })
                 .to_string(),
         )?;
+        let _task_lock = task_lock(&context.manifest, &task_id)?;
         context.git.run(
             &context.facts.root,
             InternalGitProfile::WorktreeManagement,
-            &args(&["branch", &branch, &source.head_oid]),
+            &args2(&["update-ref", &branch, &source.head_oid]),
         )?;
         context.git.run(
             &context.facts.root,
@@ -967,7 +965,7 @@ impl Application {
                 OsString::from("worktree"),
                 OsString::from("add"),
                 path.as_os_str().to_owned(),
-                OsString::from(&branch),
+                OsString::from(branch.trim_start_matches("refs/heads/")),
             ],
         )?;
         let mut env = BTreeMap::new();
@@ -992,7 +990,11 @@ impl Application {
             None,
         )?;
         let facts = task_facts(&context.git, &record, &context.facts)?;
-        if !task::content_state(&context.git, &facts, &path)?.review_clean() {
+        let restored_state = task::content_state(&context.git, &facts, &path)?;
+        if !restored_state.visibility_flags.is_empty()
+            || restored_state.in_progress
+            || !restored_state.ignored_residue.is_empty()
+        {
             return Err(AppError::diagnostic(
                 "AGT-0725",
                 "restored checkpoint did not reproduce a review-clean state",
@@ -1074,6 +1076,7 @@ impl Application {
                 ErrorKind::LockConflict,
             ));
         }
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
         let snapshot = context.state.config(&record.id)?;
         let start_head = context.git.text(
             &record.path,
@@ -1196,6 +1199,7 @@ impl Application {
                 ErrorKind::StateInconsistent,
             ));
         }
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
         let facts = task_facts(&context.git, &record, &context.facts)?;
         task::ensure_mutation_pristine(&context.git, &facts, &record.path)?;
         let operation = context.state.create_operation(OperationKind::Sync, Some(&record.id), &serde_json::json!({ "target": target, "target_oid": target_oid, "pre_head": record.head_oid, "base": record.base_oid }).to_string())?;
@@ -1349,6 +1353,8 @@ impl Application {
             &task_facts(&context.git, &record, &context.facts)?,
             &record.path,
         )?;
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
+        let _repo_lock = repo_lock(&context.manifest)?;
         let target = arguments.onto.unwrap_or_else(|| {
             current_branch(&context.git, &context.facts.root).unwrap_or_default()
         });
@@ -1445,7 +1451,7 @@ impl Application {
                 OsString::from("worktree"),
                 OsString::from("add"),
                 landing_path.as_os_str().to_owned(),
-                OsString::from(&target_ref),
+                OsString::from(target_ref.trim_start_matches("refs/heads/")),
             ],
         )?;
         let landing_facts = repository::discover(&context.git, &landing_path)?;

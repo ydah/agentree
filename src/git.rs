@@ -50,6 +50,13 @@ impl GitRunner {
 
     pub fn prepare_hooks(&self) -> Result<(), AppError> {
         std::fs::create_dir_all(&self.hooks_dir)?;
+        if std::fs::read_dir(&self.hooks_dir)?.next().is_some() {
+            return Err(AppError::diagnostic(
+                "AGT-0209",
+                "trusted hooks directory is not empty",
+                crate::domain::ErrorKind::StateInconsistent,
+            ));
+        }
         Ok(())
     }
 

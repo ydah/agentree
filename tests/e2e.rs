@@ -168,3 +168,174 @@ fn land_into_current_is_fast_forward_only() {
     let task_head = String::from_utf8(git(&worktree, &["rev-parse", "HEAD"]).stdout).expect("oid");
     assert_eq!(target.trim(), task_head.trim());
 }
+
+#[test]
+fn sync_rebases_only_the_task_against_an_exact_target() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "sync"]).status.success());
+    let task_path = run(repo.path(), &["context", "sync", "--json"]);
+    let context: Value = serde_json::from_slice(&task_path.stdout).expect("context JSON");
+    let worktree = PathBuf::from(context["result"]["worktree"].as_str().expect("worktree"));
+    let committed = run(
+        repo.path(),
+        &[
+            "run",
+            "sync",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf task > task.txt; git add task.txt; git commit -m task",
+        ],
+    );
+    assert!(
+        committed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    fs::write(repo.path().join("target.txt"), "target\n").expect("target change");
+    assert!(git(repo.path(), &["add", "target.txt"]).status.success());
+    assert!(git(repo.path(), &["commit", "-qm", "target"])
+        .status
+        .success());
+    let synced = run(repo.path(), &["sync", "sync", "--onto", "main"]);
+    assert!(
+        synced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
+    assert!(worktree.join("target.txt").exists());
+    assert!(git(repo.path(), &["diff", "--quiet", "--", "target.txt"])
+        .status
+        .success());
+}
+
+#[test]
+fn temporary_landing_worktree_updates_only_an_unclaimed_target() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "temporary"]).status.success());
+    let committed = run(
+        repo.path(),
+        &[
+            "run",
+            "temporary",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf landed > landed.txt; git add landed.txt; git commit -m landed",
+        ],
+    );
+    assert!(
+        committed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    assert!(git(repo.path(), &["branch", "release"]).status.success());
+    let landed = run(repo.path(), &["land", "temporary", "--onto", "release"]);
+    assert!(
+        landed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&landed.stderr)
+    );
+    let release_head =
+        String::from_utf8(git(repo.path(), &["rev-parse", "release"]).stdout).expect("oid");
+    let task_context = run(repo.path(), &["context", "temporary", "--json"]);
+    let context: Value = serde_json::from_slice(&task_context.stdout).expect("context JSON");
+    let task_path = PathBuf::from(context["result"]["worktree"].as_str().expect("worktree"));
+    let task_head = String::from_utf8(git(&task_path, &["rev-parse", "HEAD"]).stdout).expect("oid");
+    assert_eq!(release_head.trim(), task_head.trim());
+}
+
+#[test]
+fn checkpoint_restore_recreates_a_dirty_task_without_deleting_the_source() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "source"]).status.success());
+    let created = run(
+        repo.path(),
+        &[
+            "run",
+            "source",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf staged > README; git add README; printf unstaged > README",
+        ],
+    );
+    assert!(created.status.success());
+    let list = run(repo.path(), &["checkpoint", "list", "source", "--json"]);
+    let envelope: Value = serde_json::from_slice(&list.stdout).expect("checkpoint JSON");
+    let checkpoint_id = envelope["result"][0]["id"].as_str().expect("checkpoint id");
+    let restored = run(
+        repo.path(),
+        &[
+            "checkpoint",
+            "restore",
+            checkpoint_id,
+            "--to-new-task",
+            "recovered",
+            "--json",
+        ],
+    );
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    let restored_path = result_path(&restored);
+    let status = git(&restored_path, &["status", "--porcelain"]);
+    assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "MM README");
+    let source = run(repo.path(), &["context", "source", "--json"]);
+    assert!(source.status.success());
+}
+
+#[test]
+fn fetch_does_not_prune_or_write_outside_remote_tracking_refs() {
+    let repo = fixture();
+    let remote = tempfile::tempdir().expect("remote tempdir");
+    assert!(git(remote.path(), &["init", "--bare", "-q"])
+        .status
+        .success());
+    assert!(git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote.path().to_str().expect("remote path")
+        ]
+    )
+    .status
+    .success());
+    assert!(git(repo.path(), &["push", "-q", "origin", "main"])
+        .status
+        .success());
+    let head = String::from_utf8(git(repo.path(), &["rev-parse", "HEAD"]).stdout).expect("oid");
+    assert!(git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/stale", head.trim()]
+    )
+    .status
+    .success());
+    assert!(git(repo.path(), &["config", "fetch.prune", "true"])
+        .status
+        .success());
+    assert!(run(repo.path(), &["init"]).status.success());
+    let fetched = run(repo.path(), &["fetch", "--remote", "origin"]);
+    assert!(
+        fetched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fetched.stderr)
+    );
+    let stale = git(
+        repo.path(),
+        &["show-ref", "--verify", "refs/remotes/origin/stale"],
+    );
+    assert!(
+        stale.status.success(),
+        "fetch unexpectedly pruned a stale ref"
+    );
+    let fetch_head = repo.path().join(".git/FETCH_HEAD");
+    assert!(!fetch_head.exists(), "fetch unexpectedly wrote FETCH_HEAD");
+}
