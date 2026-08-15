@@ -2873,7 +2873,7 @@ fn child_identity_verified(session: &SessionRecord) -> bool {
 
 fn classify_session(session: &SessionRecord) -> &'static str {
     let Some(supervisor_pid) = session.supervisor_pid else {
-        return "orphaned";
+        return "unknown";
     };
     if !process_exists(supervisor_pid) {
         return "orphaned";
