@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use globset::{Glob, GlobSetBuilder};
+
 use crate::{
     domain::{AppError, ErrorKind, InternalGitProfile, WorktreeContentState},
     git::{args, nul_records, GitRunner},
@@ -21,6 +23,50 @@ pub fn branch_for(slug: &str, task_id: &str) -> Result<String, AppError> {
         ));
     }
     Ok(format!("refs/heads/agentree/{clean}-{task_id}"))
+}
+
+pub fn validate_scopes(scopes: &[String]) -> Result<(), AppError> {
+    let mut builder = GlobSetBuilder::new();
+    for scope in scopes {
+        if scope.is_empty() || scope.starts_with('/') || scope.split('/').any(|part| part == "..") {
+            return Err(AppError::diagnostic(
+                "AGT-0509",
+                format!("invalid task scope: {scope}"),
+                ErrorKind::Usage,
+            ));
+        }
+        builder.add(Glob::new(scope).map_err(|error| {
+            AppError::diagnostic("AGT-0510", error.to_string(), ErrorKind::Usage)
+        })?);
+    }
+    let _ = builder
+        .build()
+        .map_err(|error| AppError::diagnostic("AGT-0511", error.to_string(), ErrorKind::Usage))?;
+    Ok(())
+}
+
+pub fn scope_violations(
+    scopes: &[String],
+    paths: &std::collections::BTreeSet<String>,
+) -> Result<Vec<String>, AppError> {
+    validate_scopes(scopes)?;
+    if scopes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut builder = GlobSetBuilder::new();
+    for scope in scopes {
+        builder.add(Glob::new(scope).map_err(|error| {
+            AppError::diagnostic("AGT-0512", error.to_string(), ErrorKind::Usage)
+        })?);
+    }
+    let set = builder
+        .build()
+        .map_err(|error| AppError::diagnostic("AGT-0513", error.to_string(), ErrorKind::Usage))?;
+    Ok(paths
+        .iter()
+        .filter(|path| !set.is_match(path))
+        .cloned()
+        .collect())
 }
 
 pub fn path_for(root: &Path, slug: &str, task_id: &str) -> Result<PathBuf, AppError> {

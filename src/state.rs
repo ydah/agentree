@@ -119,6 +119,17 @@ impl State {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn operation(&self, id: &str) -> Result<OperationRecord, AppError> {
+        let connection = self.connection.lock().map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0301",
+                "state lock poisoned",
+                crate::domain::ErrorKind::Database,
+            )
+        })?;
+        connection.query_row("SELECT id, kind, status, task_id, expected_json, observed_json FROM operations WHERE id=?1", params![id], |row| Ok(OperationRecord { id: row.get(0)?, kind: row.get(1)?, status: row.get(2)?, task_id: row.get(3)?, expected: row.get(4)?, observed: row.get(5)? })).map_err(|error| match error { rusqlite::Error::QueryReturnedNoRows => AppError::diagnostic("AGT-0304", "operation not found", crate::domain::ErrorKind::Usage), other => AppError::Sqlite(other) })
+    }
+
     pub fn insert_task(&self, task: &TaskRecord) -> Result<(), AppError> {
         let connection = self.connection.lock().map_err(|_| {
             AppError::diagnostic(
@@ -342,6 +353,37 @@ impl State {
         Ok(())
     }
 
+    pub fn save_check_run(&self, run: &CheckRunRecord) -> Result<(), AppError> {
+        let connection = self.connection.lock().map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0301",
+                "state lock poisoned",
+                crate::domain::ErrorKind::Database,
+            )
+        })?;
+        connection.execute("INSERT INTO check_runs(id, task_id, head_oid, config_hash, definition_hash, status, command_json) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![run.id, run.task_id, run.head_oid, run.config_hash, run.definition_hash, run.status, run.command_json])?;
+        Ok(())
+    }
+
+    pub fn fresh_required_checks(
+        &self,
+        task_id: &str,
+        head_oid: &str,
+        config_hash: &str,
+        definition_hash: &str,
+        required_count: usize,
+    ) -> Result<bool, AppError> {
+        let connection = self.connection.lock().map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0301",
+                "state lock poisoned",
+                crate::domain::ErrorKind::Database,
+            )
+        })?;
+        let count: i64 = connection.query_row("SELECT COUNT(*) FROM check_runs WHERE task_id=?1 AND head_oid=?2 AND config_hash=?3 AND definition_hash=?4 AND status='passed'", params![task_id, head_oid, config_hash, definition_hash], |row| row.get(0))?;
+        Ok(count >= required_count as i64)
+    }
+
     pub fn checkpoints(&self, task_id: &str) -> Result<Vec<CheckpointRecord>, AppError> {
         let connection = self.connection.lock().map_err(|_| {
             AppError::diagnostic(
@@ -377,6 +419,17 @@ pub struct CheckpointRecord {
     pub metadata_oid: String,
     pub message: Option<String>,
     pub config_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckRunRecord {
+    pub id: String,
+    pub task_id: String,
+    pub head_oid: String,
+    pub config_hash: String,
+    pub definition_hash: String,
+    pub status: String,
+    pub command_json: String,
 }
 
 const SCHEMA: &str = r#"

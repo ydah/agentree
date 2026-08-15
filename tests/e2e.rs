@@ -339,3 +339,42 @@ fn fetch_does_not_prune_or_write_outside_remote_tracking_refs() {
     let fetch_head = repo.path().join(".git/FETCH_HEAD");
     assert!(!fetch_head.exists(), "fetch unexpectedly wrote FETCH_HEAD");
 }
+
+#[test]
+fn required_checks_are_bound_to_exact_head_and_make_readiness_derived() {
+    let repo = fixture();
+    fs::write(repo.path().join(".agentree.toml"), "checks = [{ name = \"unit\", command = [\"/bin/sh\", \"-c\", \"exit 0\"], required = true }]\n").expect("config");
+    assert!(git(repo.path(), &["add", ".agentree.toml"])
+        .status
+        .success());
+    assert!(git(repo.path(), &["commit", "-qm", "config"])
+        .status
+        .success());
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "checked"]).status.success());
+    let checked = run(repo.path(), &["check", "checked", "--json"]);
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let status = run(repo.path(), &["status", "--json"]);
+    let envelope: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(envelope["result"][0]["ready"], Value::Bool(true));
+    let context = run(repo.path(), &["context", "checked", "--json"]);
+    assert!(context.status.success());
+    let context_value: Value = serde_json::from_slice(&context.stdout).expect("context JSON");
+    assert_eq!(
+        context_value["result"]["readiness"]["required_checks_fresh"],
+        Value::Bool(true)
+    );
+    let worktree = PathBuf::from(
+        context_value["result"]["worktree"]
+            .as_str()
+            .expect("worktree"),
+    );
+    fs::write(worktree.join("drift"), "changed\n").expect("drift");
+    let stale = run(repo.path(), &["status", "--json"]);
+    let stale_value: Value = serde_json::from_slice(&stale.stdout).expect("stale status JSON");
+    assert_eq!(stale_value["result"][0]["ready"], Value::Bool(false));
+}

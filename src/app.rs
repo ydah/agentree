@@ -23,7 +23,7 @@ use crate::{
     git::{args, GitRunner},
     lock::FileLock,
     repository::{self, RepositoryFacts, RepositoryManifest},
-    state::{CheckpointRecord, State, TaskRecord},
+    state::{CheckRunRecord, CheckpointRecord, State, TaskRecord},
     task,
 };
 
@@ -181,6 +181,7 @@ impl Application {
                 OsString::from(format!("{base}^{{commit}}")),
             ],
         )?;
+        task::validate_scopes(&arguments.scopes)?;
         let task_id = crate::domain::Id::new("task-").0;
         let branch = task::branch_for(&arguments.slug, &task_id)?;
         let path = task::path_for(
@@ -188,6 +189,21 @@ impl Application {
             &arguments.slug,
             &task_id,
         )?;
+        if context
+            .git
+            .run(
+                &context.facts.root,
+                InternalGitProfile::Discovery,
+                &args2(&["show-ref", "--verify", &branch]),
+            )
+            .is_ok()
+        {
+            return Err(AppError::diagnostic(
+                "AGT-0514",
+                "generated task branch already exists; refusing to overwrite it",
+                ErrorKind::StateInconsistent,
+            ));
+        }
         let snapshot = config::snapshot(&context.git, &context.facts.root, &base_oid)?;
         let expected = serde_json::json!({ "branch": branch, "path": path, "base_oid": base_oid });
         let task_record = TaskRecord {
@@ -302,7 +318,25 @@ impl Application {
         for record in &tasks {
             let facts = task_facts(&context.git, record, &context.facts)?;
             let content = task::content_state(&context.git, &facts, &record.path)?;
-            result.push(serde_json::json!({ "task_id": record.id, "slug": record.slug, "state": record.lifecycle.as_str(), "branch": record.branch, "head": record.head_oid, "worktree": record.path, "dirty": !content.review_clean(), "mutation_pristine": content.mutation_pristine(), "session": context.state.sessions_for_task(&record.id)? }));
+            let observed_head = context.git.text(
+                &record.path,
+                InternalGitProfile::Discovery,
+                &args2(&["rev-parse", "HEAD"]),
+            )?;
+            let config = context.state.config(&record.id)?;
+            let definition_hash = hash_json(&config.checks)?;
+            let required_count = config.checks.iter().filter(|check| check.required).count();
+            let ready = record.lifecycle == Lifecycle::Active
+                && content.review_clean()
+                && (required_count == 0
+                    || context.state.fresh_required_checks(
+                        &record.id,
+                        &observed_head,
+                        &record.config_hash,
+                        &definition_hash,
+                        required_count,
+                    )?);
+            result.push(serde_json::json!({ "task_id": record.id, "slug": record.slug, "state": record.lifecycle.as_str(), "branch": record.branch, "head": observed_head, "recorded_head": record.head_oid, "drifted": observed_head != record.head_oid, "worktree": record.path, "dirty": !content.review_clean(), "mutation_pristine": content.mutation_pristine(), "ready": ready, "session": context.state.sessions_for_task(&record.id)? }));
         }
         if json {
             print_json("status", &result);
@@ -332,11 +366,26 @@ impl Application {
             .config(&record.id)
             .map(|config| config.checks)
             .unwrap_or_default();
+        let observed_head = context.git.text(
+            &record.path,
+            InternalGitProfile::Discovery,
+            &args2(&["rev-parse", "HEAD"]),
+        )?;
+        let definition_hash = hash_json(&checks)?;
+        let required_count = checks.iter().filter(|check| check.required).count();
+        let fresh = required_count == 0
+            || context.state.fresh_required_checks(
+                &record.id,
+                &observed_head,
+                &record.config_hash,
+                &definition_hash,
+                required_count,
+            )?;
         output(
             json,
             "context",
             None,
-            &serde_json::json!({ "task_id": record.id, "slug": record.slug, "branch": record.branch, "worktree": record.path, "base_oid": record.base_oid, "head_oid": record.head_oid, "config_hash": record.config_hash, "scopes": record.scopes, "content": content, "checks": checks, "warnings": ["Git shim is a guardrail, not an OS security boundary", "path overlap is heuristic and not semantic conflict detection"] }),
+            &serde_json::json!({ "task_id": record.id, "slug": record.slug, "branch": record.branch, "worktree": record.path, "base_oid": record.base_oid, "head_oid": observed_head, "recorded_head": record.head_oid, "config_hash": record.config_hash, "scopes": record.scopes, "content": content, "checks": checks, "readiness": { "ready": record.lifecycle == Lifecycle::Active && content.review_clean() && fresh, "required_checks_fresh": fresh }, "warnings": ["Git shim is a guardrail, not an OS security boundary", "path overlap is heuristic and not semantic conflict detection"] }),
         )
     }
 
@@ -352,7 +401,7 @@ impl Application {
     }
 
     fn run(context: &Context, arguments: RunArgs, json: bool) -> Result<i32, AppError> {
-        let record = context.state.task(&arguments.task)?;
+        let mut record = context.state.task(&arguments.task)?;
         if record.lifecycle != Lifecycle::Active {
             return Err(AppError::diagnostic(
                 "AGT-0703",
@@ -360,6 +409,7 @@ impl Application {
                 ErrorKind::StateInconsistent,
             ));
         }
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
         if context.state.sessions_for_task(&record.id)? > 0 {
             return Err(AppError::diagnostic(
                 "AGT-0704",
@@ -367,6 +417,7 @@ impl Application {
                 ErrorKind::LockConflict,
             ));
         }
+        refresh_head(context, &mut record)?;
         task::facts_match(&context.git, &record)?;
         let session_id = context.state.start_session(&record.id, 0, 0)?;
         let session_root = PathBuf::from(&context.manifest.state_dir)
@@ -436,6 +487,7 @@ impl Application {
             },
             exit_code,
         )?;
+        drop(_task_lock);
         let observed_head = context.git.text(
             &record.path,
             InternalGitProfile::Discovery,
@@ -465,7 +517,8 @@ impl Application {
         git_args: Vec<OsString>,
     ) -> Result<i32, AppError> {
         deny_inside_session()?;
-        let record = context.state.task(selector)?;
+        let mut record = context.state.task(selector)?;
+        refresh_head(context, &mut record)?;
         task::facts_match(&context.git, &record)?;
         let decision = policy_decision(&git_args)?;
         if !decision {
@@ -484,7 +537,7 @@ impl Application {
     }
 
     fn remove(context: &Context, selector: &str, json: bool) -> Result<i32, AppError> {
-        let record = context.state.task(selector)?;
+        let mut record = context.state.task(selector)?;
         if context.state.sessions_for_task(&record.id)? > 0 {
             return Err(AppError::diagnostic(
                 "AGT-0711",
@@ -501,6 +554,7 @@ impl Application {
                 ErrorKind::StateInconsistent,
             ));
         }
+        refresh_head(context, &mut record)?;
         task::facts_match(&context.git, &record)?;
         let facts = task_facts(&context.git, &record, &context.facts)?;
         let content = task::content_state(&context.git, &facts, &record.path)?;
@@ -596,7 +650,7 @@ impl Application {
                 ErrorKind::Usage,
             ));
         }
-        let record = context.state.task(selector)?;
+        let mut record = context.state.task(selector)?;
         if record.path.exists() {
             return Err(AppError::diagnostic(
                 "AGT-0717",
@@ -604,6 +658,7 @@ impl Application {
                 ErrorKind::StateInconsistent,
             ));
         }
+        refresh_head(context, &mut record)?;
         let branch_oid = context.git.text(
             &context.facts.root,
             InternalGitProfile::Discovery,
@@ -662,20 +717,175 @@ impl Application {
         json: bool,
     ) -> Result<i32, AppError> {
         if apply {
-            return Err(AppError::diagnostic(
-                "AGT-0719",
-                "doctor --apply is not enabled until operation-scoped recovery plans are available",
-                ErrorKind::Unsupported,
-            ));
+            let id = operation.ok_or_else(|| {
+                AppError::diagnostic(
+                    "AGT-0719",
+                    "doctor --apply requires --operation",
+                    ErrorKind::Usage,
+                )
+            })?;
+            let fingerprint = plan_fingerprint.ok_or_else(|| {
+                AppError::diagnostic(
+                    "AGT-0722",
+                    "doctor --apply requires --plan-fingerprint",
+                    ErrorKind::Usage,
+                )
+            })?;
+            return Self::apply_doctor_plan(context, id, fingerprint, json);
         }
         let operations = context.state.incomplete_operations()?;
-        let selected = operations.into_iter().filter(|item| operation.map(|id| id == item.id).unwrap_or(true)).map(|item| serde_json::json!({ "operation_id": item.id, "kind": item.kind, "status": item.status, "expected": item.expected, "observed": item.observed, "action": "inspect Git facts; no automatic rollback or deletion" })).collect::<Vec<_>>();
-        let _ = plan_fingerprint;
+        let selected = operations.into_iter().filter(|item| operation.map(|id| id == item.id).unwrap_or(true)).map(|item| {
+            let fingerprint = doctor_fingerprint(&item);
+            serde_json::json!({ "operation_id": item.id, "kind": item.kind, "status": item.status, "expected": item.expected, "observed": item.observed, "plan_fingerprint": fingerprint, "action": "inspect Git facts; no automatic rollback or deletion" })
+        }).collect::<Vec<_>>();
         output(
             json,
             "doctor",
             None,
             &serde_json::json!({ "read_only": true, "operations": selected }),
+        )
+    }
+
+    fn apply_doctor_plan(
+        context: &Context,
+        id: &str,
+        fingerprint: &str,
+        json: bool,
+    ) -> Result<i32, AppError> {
+        let operation = context.state.operation(id)?;
+        if doctor_fingerprint(&operation) != fingerprint {
+            return Err(AppError::diagnostic(
+                "AGT-0723",
+                "doctor plan fingerprint is stale",
+                ErrorKind::RecoveryRequired,
+            ));
+        }
+        let expected: serde_json::Value = serde_json::from_str(&operation.expected)?;
+        let Some(task_id) = operation.task_id.as_deref() else {
+            return Err(AppError::diagnostic(
+                "AGT-0724",
+                "operation has no task scope; manual intervention required",
+                ErrorKind::RecoveryRequired,
+            ));
+        };
+        let record = context.state.task(task_id)?;
+        let _task_lock = task_lock(&context.manifest, task_id)?;
+        match operation.kind.as_str() {
+            "land" => {
+                let _repo_lock = repo_lock(&context.manifest)?;
+                let target_ref = expected["target_ref"].as_str().ok_or_else(|| {
+                    AppError::diagnostic(
+                        "AGT-0725",
+                        "land operation lacks target ref",
+                        ErrorKind::RecoveryRequired,
+                    )
+                })?;
+                let task_oid = expected["task_oid"].as_str().ok_or_else(|| {
+                    AppError::diagnostic(
+                        "AGT-0726",
+                        "land operation lacks task oid",
+                        ErrorKind::RecoveryRequired,
+                    )
+                })?;
+                let observed = context.git.text(
+                    &context.facts.root,
+                    InternalGitProfile::Discovery,
+                    &args2(&["rev-parse", target_ref]),
+                )?;
+                if observed != task_oid {
+                    return Err(AppError::diagnostic(
+                        "AGT-0727",
+                        "target is not at the recorded successful task OID; rollback is forbidden",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                context
+                    .state
+                    .update_task_lifecycle(task_id, Lifecycle::Landed, None, None)?;
+                context.state.update_operation(id, OperationStatus::Completed, &serde_json::json!({ "phase": "finalized_after_target_update", "target_oid": observed }).to_string())?;
+            }
+            "remove_worktree" => {
+                if record.path.exists() {
+                    return Err(AppError::diagnostic(
+                        "AGT-0728",
+                        "owned worktree still exists; doctor will not delete it",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                context
+                    .state
+                    .update_task_lifecycle(task_id, Lifecycle::Archived, None, None)?;
+                context.state.update_operation(
+                    id,
+                    OperationStatus::Completed,
+                    "{\"phase\":\"finalized_after_worktree_absence\"}",
+                )?;
+            }
+            "create_task" => {
+                task::facts_match(&context.git, &record)?;
+                context.state.update_operation(
+                    id,
+                    OperationStatus::Completed,
+                    "{\"phase\":\"finalized_after_fact_match\"}",
+                )?;
+            }
+            "archive" => {
+                if record.lifecycle != Lifecycle::Archived {
+                    return Err(AppError::diagnostic(
+                        "AGT-0729",
+                        "archive operation is not reflected in state",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                context.state.update_operation(
+                    id,
+                    OperationStatus::Completed,
+                    "{\"phase\":\"finalized\"}",
+                )?;
+            }
+            "delete_branch" => {
+                let _repo_lock = repo_lock(&context.manifest)?;
+                let branch = expected["branch"].as_str().ok_or_else(|| {
+                    AppError::diagnostic(
+                        "AGT-0730",
+                        "delete operation lacks branch",
+                        ErrorKind::RecoveryRequired,
+                    )
+                })?;
+                if context
+                    .git
+                    .run(
+                        &context.facts.root,
+                        InternalGitProfile::Discovery,
+                        &args2(&["show-ref", "--verify", branch]),
+                    )
+                    .is_ok()
+                {
+                    return Err(AppError::diagnostic(
+                        "AGT-0731",
+                        "owned branch still exists; doctor will not delete it",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                context.state.update_operation(
+                    id,
+                    OperationStatus::Completed,
+                    "{\"phase\":\"finalized_after_ref_absence\"}",
+                )?;
+            }
+            _ => {
+                return Err(AppError::diagnostic(
+                    "AGT-0732",
+                    "operation requires manual intervention",
+                    ErrorKind::RecoveryRequired,
+                ))
+            }
+        }
+        output(
+            json,
+            "doctor",
+            Some(id),
+            &serde_json::json!({ "applied": true, "operation_id": id, "rollback": false }),
         )
     }
 
@@ -753,6 +963,7 @@ impl Application {
         }
         task::facts_match(&context.git, &record)?;
         let facts = task_facts(&context.git, &record, &context.facts)?;
+        ensure_index_unlocked(&facts.index_path)?;
         let state = task::content_state(&context.git, &facts, &record.path)?;
         if state.in_progress || !state.visibility_flags.is_empty() {
             return Err(AppError::diagnostic(
@@ -761,12 +972,12 @@ impl Application {
                 ErrorKind::Unsupported,
             ));
         }
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
         let operation = context.state.create_operation(
             OperationKind::Checkpoint,
             Some(&record.id),
             &serde_json::json!({ "head": record.head_oid, "index": facts.index_path }).to_string(),
         )?;
-        let _task_lock = task_lock(&context.manifest, &record.id)?;
         let tmp_root = PathBuf::from(&context.manifest.state_dir).join("tmp");
         fs::create_dir_all(&tmp_root)?;
         let frozen = tmp_root.join(format!("index-{}", operation.id));
@@ -830,6 +1041,7 @@ impl Application {
             &args(&["write-tree"]),
             &env_two,
         )?;
+        ensure_index_unlocked(&facts.index_path)?;
         if tree_one != tree_two || before != sha256_file(&facts.index_path)? {
             return Err(AppError::diagnostic(
                 "AGT-0723",
@@ -1040,11 +1252,12 @@ impl Application {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut changes = BTreeMap::new();
+        let mut reports = Vec::new();
         for record in &tasks {
-            changes.insert(
-                record.id.clone(),
-                task::all_change_paths(&context.git, record)?,
-            );
+            let paths = task::all_change_paths(&context.git, record)?;
+            let violations = task::scope_violations(&record.scopes, &paths)?;
+            reports.push(serde_json::json!({ "task_id": record.id, "planned_scopes": record.scopes, "actual_paths": paths.clone(), "scope_violations": violations }));
+            changes.insert(record.id.clone(), paths);
         }
         let mut pairs = Vec::new();
         let ids: Vec<_> = changes.keys().cloned().collect();
@@ -1063,7 +1276,7 @@ impl Application {
             json,
             "overlap",
             None,
-            &serde_json::json!({ "pairs": pairs, "heuristic": true }),
+            &serde_json::json!({ "tasks": reports, "pairs": pairs, "heuristic": true, "semantic_conflict_detection": false }),
         )
     }
 
@@ -1078,12 +1291,14 @@ impl Application {
         }
         let _task_lock = task_lock(&context.manifest, &record.id)?;
         let snapshot = context.state.config(&record.id)?;
+        let definition_hash = hash_json(&snapshot.checks)?;
         let start_head = context.git.text(
             &record.path,
             InternalGitProfile::Discovery,
             &args(&["rev-parse", "HEAD"]),
         )?;
         let mut results = Vec::new();
+        let mut required_failure = false;
         for definition in snapshot.checks {
             let mut command = Command::new(&definition.command[0]);
             command.args(definition.command.iter().skip(1));
@@ -1106,14 +1321,41 @@ impl Application {
                     &record.path,
                 )?
                 .review_clean();
-            results.push(serde_json::json!({ "name": definition.name, "required": definition.required, "exit_code": output.status.code(), "passed": output.status.success(), "stale": stale, "head_oid": start_head, "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr) }));
+            let passed = output.status.success() && !stale;
+            if definition.required && !passed {
+                required_failure = true;
+            }
+            context.state.save_check_run(&CheckRunRecord {
+                id: crate::domain::Id::new("check-").0,
+                task_id: record.id.clone(),
+                head_oid: start_head.clone(),
+                config_hash: snapshot.hash.clone(),
+                definition_hash: definition_hash.clone(),
+                status: if passed {
+                    "passed".to_owned()
+                } else if stale {
+                    "stale".to_owned()
+                } else {
+                    "failed".to_owned()
+                },
+                command_json: serde_json::to_string(&definition.command)?,
+            })?;
+            results.push(serde_json::json!({ "name": definition.name, "required": definition.required, "exit_code": output.status.code(), "passed": passed, "stale": stale, "head_oid": start_head.clone(), "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr) }));
         }
         output(
             json,
             "check",
             None,
             &serde_json::json!({ "task_id": record.id, "results": results }),
-        )
+        )?;
+        if required_failure {
+            return Err(AppError::diagnostic(
+                "AGT-0726",
+                "a required check failed or became stale",
+                ErrorKind::StateInconsistent,
+            ));
+        }
+        Ok(0)
     }
 
     fn fetch(context: &Context, remote: &str, json: bool) -> Result<i32, AppError> {
@@ -1166,7 +1408,7 @@ impl Application {
     }
 
     fn sync(context: &Context, arguments: SyncArgs, json: bool) -> Result<i32, AppError> {
-        let record = context.state.task(&arguments.task)?;
+        let mut record = context.state.task(&arguments.task)?;
         if arguments.r#continue || arguments.abort {
             return Self::sync_continuation(
                 context,
@@ -1200,6 +1442,7 @@ impl Application {
             ));
         }
         let _task_lock = task_lock(&context.manifest, &record.id)?;
+        refresh_head(context, &mut record)?;
         let facts = task_facts(&context.git, &record, &context.facts)?;
         task::ensure_mutation_pristine(&context.git, &facts, &record.path)?;
         let operation = context.state.create_operation(OperationKind::Sync, Some(&record.id), &serde_json::json!({ "target": target, "target_oid": target_oid, "pre_head": record.head_oid, "base": record.base_oid }).to_string())?;
@@ -1347,14 +1590,21 @@ impl Application {
                 ErrorKind::Usage,
             ));
         }
+        if record.lifecycle != Lifecycle::Active {
+            return Err(AppError::diagnostic(
+                "AGT-0738",
+                "land requires an active task",
+                ErrorKind::StateInconsistent,
+            ));
+        }
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
+        let _repo_lock = repo_lock(&context.manifest)?;
         task::facts_match(&context.git, &record)?;
         task::ensure_review_clean(
             &context.git,
             &task_facts(&context.git, &record, &context.facts)?,
             &record.path,
         )?;
-        let _task_lock = task_lock(&context.manifest, &record.id)?;
-        let _repo_lock = repo_lock(&context.manifest)?;
         let target = arguments.onto.unwrap_or_else(|| {
             current_branch(&context.git, &context.facts.root).unwrap_or_default()
         });
@@ -1369,6 +1619,24 @@ impl Application {
             InternalGitProfile::Discovery,
             &args2(&["rev-parse", "HEAD"]),
         )?;
+        let config = context.state.config(&record.id)?;
+        let definition_hash = hash_json(&config.checks)?;
+        let required_count = config.checks.iter().filter(|check| check.required).count();
+        if required_count > 0
+            && !context.state.fresh_required_checks(
+                &record.id,
+                &task_oid,
+                &record.config_hash,
+                &definition_hash,
+                required_count,
+            )?
+        {
+            return Err(AppError::diagnostic(
+                "AGT-0739",
+                "required checks are missing or stale for the exact task HEAD",
+                ErrorKind::StateInconsistent,
+            ));
+        }
         let operation = context.state.create_operation(OperationKind::Land, Some(&record.id), &serde_json::json!({ "task_ref": record.branch, "task_oid": task_oid, "target_ref": target_ref, "target_old_oid": target_oid }).to_string())?;
         let safety_task = format!(
             "refs/agentree/safety/land/task/{}/{}",
@@ -1600,6 +1868,21 @@ fn task_facts(
     })
 }
 
+fn refresh_head(context: &Context, record: &mut TaskRecord) -> Result<(), AppError> {
+    let observed = context.git.text(
+        &record.path,
+        InternalGitProfile::Discovery,
+        &args2(&["rev-parse", "HEAD"]),
+    )?;
+    if observed != record.head_oid {
+        context
+            .state
+            .update_task_lifecycle(&record.id, record.lifecycle, Some(&observed), None)?;
+        record.head_oid = observed;
+    }
+    Ok(())
+}
+
 fn resolve_git_dir(git: &GitRunner, root: &Path) -> Result<PathBuf, AppError> {
     let value = git.text(
         root,
@@ -1686,6 +1969,28 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn ensure_index_unlocked(index: &Path) -> Result<(), AppError> {
+    let lock = index.parent().unwrap_or(Path::new(".")).join(format!(
+        "{}.lock",
+        index.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    if lock.exists() {
+        return Err(AppError::diagnostic(
+            "AGT-0748",
+            "Git index is locked by another process",
+            ErrorKind::LockConflict,
+        ));
+    }
+    Ok(())
+}
+
+fn hash_json<T: Serialize>(value: &T) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn process_birth_identity(pid: u32) -> String {
@@ -1877,6 +2182,10 @@ fn output<T: Serialize>(
         println!("{}", serde_json::to_string_pretty(result)?);
     }
     Ok(0)
+}
+
+fn doctor_fingerprint(operation: &crate::state::OperationRecord) -> String {
+    hash_json(&serde_json::json!({ "operation_id": operation.id, "kind": operation.kind, "status": operation.status, "task_id": operation.task_id, "expected": operation.expected, "observed": operation.observed })).unwrap_or_else(|_| "unavailable".to_owned())
 }
 
 fn print_json<T: Serialize>(command: &str, result: &T) {
