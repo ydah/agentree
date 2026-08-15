@@ -58,6 +58,8 @@ pub enum Command {
         #[arg(long)]
         operation: Option<String>,
         #[arg(long)]
+        plan: bool,
+        #[arg(long)]
         apply: bool,
         #[arg(long)]
         plan_fingerprint: Option<String>,
@@ -66,9 +68,7 @@ pub enum Command {
         #[command(subcommand)]
         command: CheckpointCommand,
     },
-    Overlap {
-        tasks: Vec<String>,
-    },
+    Overlap(OverlapArgs),
     Check {
         task: String,
     },
@@ -108,6 +108,19 @@ pub enum CheckpointCommand {
         #[arg(long)]
         to_new_task: String,
     },
+    #[command(external_subcommand)]
+    Legacy(Vec<OsString>),
+}
+
+#[derive(Debug, Args)]
+pub struct OverlapArgs {
+    pub tasks: Vec<String>,
+    #[arg(long, conflicts_with_all = ["actual", "all"])]
+    pub planned: bool,
+    #[arg(long, conflicts_with_all = ["planned", "all"])]
+    pub actual: bool,
+    #[arg(long, conflicts_with_all = ["planned", "actual"])]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]

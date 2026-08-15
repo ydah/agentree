@@ -2,9 +2,15 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -12,8 +18,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     cli::{
-        self, CheckpointCommand, Command as CliCommand, ConfigCommand, LandArgs, NewArgs, RunArgs,
-        SyncArgs,
+        self, CheckpointCommand, Command as CliCommand, ConfigCommand, LandArgs, NewArgs,
+        OverlapArgs, RunArgs, SyncArgs,
     },
     config,
     domain::{
@@ -42,7 +48,6 @@ impl Application {
             return Self::dispatch_shim(raw_args);
         }
         let cli = cli::parse_args(raw_args).map_err(clap_to_error)?;
-        deny_administrative_command_in_session(&cli.command)?;
         let git = GitRunner::resolve()?;
         let start = cli
             .repository
@@ -50,6 +55,7 @@ impl Application {
             .map(PathBuf::from)
             .unwrap_or(std::env::current_dir()?);
         let facts = repository::discover(&git, &start)?;
+        enforce_session_guard(&git, &facts, &cli.command)?;
         match cli.command {
             CliCommand::Init => Self::init(&git, &facts, cli.json),
             CliCommand::Config {
@@ -92,17 +98,19 @@ impl Application {
             } => Self::delete_branch(&context, &selector, yes, json),
             CliCommand::Doctor {
                 operation,
+                plan,
                 apply,
                 plan_fingerprint,
             } => Self::doctor(
                 &context,
                 operation.as_deref(),
+                plan,
                 apply,
                 plan_fingerprint.as_deref(),
                 json,
             ),
             CliCommand::Checkpoint { command } => Self::checkpoint_command(&context, command, json),
-            CliCommand::Overlap { tasks } => Self::overlap(&context, tasks, json),
+            CliCommand::Overlap(arguments) => Self::overlap(&context, arguments, json),
             CliCommand::Check { task: selector } => Self::check(&context, &selector, json),
             CliCommand::Fetch { remote } => Self::fetch(&context, &remote, json),
             CliCommand::Sync(args) => Self::sync(&context, args, json),
@@ -420,61 +428,37 @@ impl Application {
         refresh_head(context, &mut record)?;
         task::facts_match(&context.git, &record)?;
         let session_id = context.state.start_session(&record.id, 0, 0)?;
-        let session_root = PathBuf::from(&context.manifest.state_dir)
-            .join("sessions")
-            .join(&session_id);
-        let shim_dir = session_root.join("bin");
-        fs::create_dir_all(&shim_dir)?;
-        let executable = std::env::current_exe()?;
-        let shim = shim_dir.join("git");
-        create_link_or_copy(&executable, &shim)?;
-        let mut command = Command::new(&arguments.program[0]);
-        command.args(arguments.program.iter().skip(1));
-        command.current_dir(&record.path);
-        command
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        sanitize_child_environment(&mut command);
-        command.env("AGENTREE_SESSION_ID", &session_id);
-        command.env("AGENTREE_TASK_ID", &record.id);
-        command.env("AGENTREE_REPOSITORY_ID", &context.manifest.repository_id);
-        command.env("AGENTREE_CONFIG_HASH", &record.config_hash);
-        let old_path = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![shim_dir.clone()];
-        paths.extend(std::env::split_paths(&old_path).filter(|path| path != &shim_dir));
-        command.env(
-            "PATH",
-            std::env::join_paths(paths).map_err(|_| {
-                AppError::diagnostic("AGT-0705", "cannot construct child PATH", ErrorKind::Io)
-            })?,
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setpgid(0, 0) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+        let mut child = match spawn_session_child(context, &record, &arguments, &session_id) {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = context.state.finish_session(&session_id, "failed", None);
+                return Err(error);
             }
-        }
-        let mut child = command.spawn()?;
+        };
         let pid = child.id();
         #[cfg(unix)]
         {
             let _ = unsafe { libc::setpgid(pid as i32, pid as i32) };
         }
         let pgid = pid;
-        context.state.update_session_identity(
+        if let Err(error) = context.state.update_session_identity(
             &session_id,
             pid,
             pgid,
             &process_birth_identity(pid),
-        )?;
-        let status = child.wait()?;
+        ) {
+            terminate_child(&mut child);
+            let _ = child.wait();
+            let _ = context.state.finish_session(&session_id, "failed", None);
+            return Err(error);
+        }
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = context.state.finish_session(&session_id, "failed", None);
+                return Err(error.into());
+            }
+        };
         let exit_code = status
             .code()
             .or_else(|| if status.success() { Some(0) } else { Some(1) });
@@ -501,12 +485,49 @@ impl Application {
         )?;
         let mut post_run_record = record.clone();
         post_run_record.head_oid = observed_head;
-        let checkpoint = Self::checkpoint_task(context, &post_run_record, None)
-            .map(|_| "created")
-            .unwrap_or("not-created");
-        let result = serde_json::json!({ "session_id": session_id, "child_exit_code": exit_code, "post_run_checkpoint": checkpoint });
+        let checkpoint_result = Self::checkpoint_task(context, &post_run_record, None);
+        let checkpoint = if checkpoint_result.is_ok() {
+            "created"
+        } else {
+            "not-created"
+        };
+        let mut post_checks = serde_json::Value::Null;
+        let mut post_processing_error = checkpoint_result.err().map(|error| error.to_string());
+        if arguments.require_post_checks {
+            match Self::execute_checks(context, &record.id) {
+                Ok((results, required_failure)) => {
+                    post_checks = serde_json::json!({
+                        "required_failure": required_failure,
+                        "results": results,
+                    });
+                    if required_failure {
+                        post_processing_error =
+                            Some("a required post-run check failed or became stale".to_owned());
+                    }
+                }
+                Err(error) => {
+                    post_processing_error = Some(error.to_string());
+                    post_checks = serde_json::json!({ "error": error.to_string() });
+                }
+            }
+        }
+        let result = serde_json::json!({
+            "session_id": session_id,
+            "child_exit_code": exit_code,
+            "post_run_checkpoint": checkpoint,
+            "post_checks": post_checks,
+        });
         if json {
             print_json("run", &result);
+        }
+        if arguments.require_post_checks {
+            if let Some(error) = post_processing_error {
+                return Err(AppError::diagnostic(
+                    "AGT-0750",
+                    error,
+                    ErrorKind::StateInconsistent,
+                ));
+            }
         }
         Ok(exit_code.unwrap_or(1))
     }
@@ -650,7 +671,31 @@ impl Application {
                 ErrorKind::Usage,
             ));
         }
-        let mut record = context.state.task(selector)?;
+        let record = context.state.task(selector)?;
+        if !matches!(record.lifecycle, Lifecycle::Archived | Lifecycle::Landed) {
+            return Err(AppError::diagnostic(
+                "AGT-0759",
+                "branch deletion requires an archived or landed task",
+                ErrorKind::StateInconsistent,
+            ));
+        }
+        if context.state.sessions_for_task(&record.id)? > 0 {
+            return Err(AppError::diagnostic(
+                "AGT-0760",
+                "active session prevents branch deletion",
+                ErrorKind::LockConflict,
+            ));
+        }
+        if context
+            .state
+            .has_incomplete_operation_for_task(&record.id)?
+        {
+            return Err(AppError::diagnostic(
+                "AGT-0761",
+                "incomplete operation prevents branch deletion",
+                ErrorKind::RecoveryRequired,
+            ));
+        }
         if record.path.exists() {
             return Err(AppError::diagnostic(
                 "AGT-0717",
@@ -658,7 +703,8 @@ impl Application {
                 ErrorKind::StateInconsistent,
             ));
         }
-        refresh_head(context, &mut record)?;
+        let _task_lock = task_lock(&context.manifest, &record.id)?;
+        let _repo_lock = repo_lock(&context.manifest)?;
         let branch_oid = context.git.text(
             &context.facts.root,
             InternalGitProfile::Discovery,
@@ -712,10 +758,18 @@ impl Application {
     fn doctor(
         context: &Context,
         operation: Option<&str>,
+        plan: bool,
         apply: bool,
         plan_fingerprint: Option<&str>,
         json: bool,
     ) -> Result<i32, AppError> {
+        if plan && operation.is_none() {
+            return Err(AppError::diagnostic(
+                "AGT-0755",
+                "doctor --plan requires --operation",
+                ErrorKind::Usage,
+            ));
+        }
         if apply {
             let id = operation.ok_or_else(|| {
                 AppError::diagnostic(
@@ -937,6 +991,46 @@ impl Application {
             }
             CheckpointCommand::Restore { id, to_new_task } => {
                 Self::restore_checkpoint(context, &id, &to_new_task, json)
+            }
+            CheckpointCommand::Legacy(arguments) => {
+                let selector = arguments.first().ok_or_else(|| {
+                    AppError::diagnostic(
+                        "AGT-0756",
+                        "checkpoint requires a task selector",
+                        ErrorKind::Usage,
+                    )
+                })?;
+                let mut message = None;
+                let mut index = 1;
+                while index < arguments.len() {
+                    let argument = arguments[index].to_string_lossy();
+                    if argument == "-m" || argument == "--message" {
+                        index += 1;
+                        let value = arguments.get(index).ok_or_else(|| {
+                            AppError::diagnostic(
+                                "AGT-0757",
+                                "checkpoint message is missing",
+                                ErrorKind::Usage,
+                            )
+                        })?;
+                        message = Some(value.to_string_lossy().into_owned());
+                    } else {
+                        return Err(AppError::diagnostic(
+                            "AGT-0758",
+                            format!("unknown checkpoint argument: {argument}"),
+                            ErrorKind::Usage,
+                        ));
+                    }
+                    index += 1;
+                }
+                let record = context.state.task(&selector.to_string_lossy())?;
+                let checkpoint = Self::checkpoint_task(context, &record, message.as_deref())?;
+                output(
+                    json,
+                    "checkpoint",
+                    Some(&checkpoint.id),
+                    &serde_json::json!(checkpoint),
+                )
             }
         }
     }
@@ -1242,33 +1336,57 @@ impl Application {
         )
     }
 
-    fn overlap(context: &Context, selectors: Vec<String>, json: bool) -> Result<i32, AppError> {
-        let tasks = if selectors.is_empty() {
+    fn overlap(context: &Context, arguments: OverlapArgs, json: bool) -> Result<i32, AppError> {
+        let show_all = arguments.all || (!arguments.planned && !arguments.actual);
+        let show_planned = arguments.planned || show_all;
+        let show_actual = arguments.actual || show_all;
+        let tasks = if arguments.tasks.is_empty() {
             context.state.tasks()?
         } else {
-            selectors
+            arguments
+                .tasks
                 .iter()
                 .map(|selector| context.state.task(selector))
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut changes = BTreeMap::new();
+        let mut scopes = BTreeMap::new();
         let mut reports = Vec::new();
         for record in &tasks {
             let paths = task::all_change_paths(&context.git, record)?;
             let violations = task::scope_violations(&record.scopes, &paths)?;
-            reports.push(serde_json::json!({ "task_id": record.id, "planned_scopes": record.scopes, "actual_paths": paths.clone(), "scope_violations": violations }));
+            scopes.insert(record.id.clone(), record.scopes.clone());
             changes.insert(record.id.clone(), paths);
+            reports.push(serde_json::json!({
+                "task_id": record.id,
+                "planned_scopes": if show_planned { serde_json::json!(record.scopes) } else { serde_json::Value::Null },
+                "actual_paths": if show_actual { serde_json::json!(changes[&record.id]) } else { serde_json::Value::Null },
+                "scope_violations": if show_actual { serde_json::json!(violations) } else { serde_json::Value::Null },
+            }));
         }
         let mut pairs = Vec::new();
+        let mut planned_pairs = Vec::new();
         let ids: Vec<_> = changes.keys().cloned().collect();
         for (index, left) in ids.iter().enumerate() {
             for right in ids.iter().skip(index + 1) {
-                let intersection: Vec<_> = changes[left]
-                    .intersection(&changes[right])
-                    .cloned()
-                    .collect();
-                if !intersection.is_empty() {
-                    pairs.push(serde_json::json!({ "left": left, "right": right, "paths": intersection, "semantic_conflict": false }));
+                if show_actual {
+                    let intersection: Vec<_> = changes[left]
+                        .intersection(&changes[right])
+                        .cloned()
+                        .collect();
+                    if !intersection.is_empty() {
+                        pairs.push(serde_json::json!({ "left": left, "right": right, "paths": intersection, "semantic_conflict": false }));
+                    }
+                }
+                if show_planned {
+                    let intersection: Vec<_> = scopes[left]
+                        .iter()
+                        .filter(|scope| scopes[right].contains(scope))
+                        .cloned()
+                        .collect();
+                    if !intersection.is_empty() {
+                        planned_pairs.push(serde_json::json!({ "left": left, "right": right, "scopes": intersection, "semantic_conflict": false }));
+                    }
                 }
             }
         }
@@ -1276,11 +1394,33 @@ impl Application {
             json,
             "overlap",
             None,
-            &serde_json::json!({ "tasks": reports, "pairs": pairs, "heuristic": true, "semantic_conflict_detection": false }),
+            &serde_json::json!({ "tasks": reports, "pairs": pairs, "planned_pairs": planned_pairs, "mode": if show_all { "all" } else if show_planned { "planned" } else { "actual" }, "heuristic": true, "semantic_conflict_detection": false }),
         )
     }
 
     fn check(context: &Context, selector: &str, json: bool) -> Result<i32, AppError> {
+        let record = context.state.task(selector)?;
+        let (results, required_failure) = Self::execute_checks(context, &record.id)?;
+        output(
+            json,
+            "check",
+            None,
+            &serde_json::json!({ "task_id": record.id, "results": results }),
+        )?;
+        if required_failure {
+            return Err(AppError::diagnostic(
+                "AGT-0726",
+                "a required check failed or became stale",
+                ErrorKind::StateInconsistent,
+            ));
+        }
+        Ok(0)
+    }
+
+    fn execute_checks(
+        context: &Context,
+        selector: &str,
+    ) -> Result<(Vec<serde_json::Value>, bool), AppError> {
         let record = context.state.task(selector)?;
         if context.state.sessions_for_task(&record.id)? > 0 {
             return Err(AppError::diagnostic(
@@ -1300,15 +1440,7 @@ impl Application {
         let mut results = Vec::new();
         let mut required_failure = false;
         for definition in snapshot.checks {
-            let mut command = Command::new(&definition.command[0]);
-            command.args(definition.command.iter().skip(1));
-            command.current_dir(&record.path);
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            sanitize_child_environment(&mut command);
-            let output = command.output()?;
+            let process = run_bounded_check(&record.path, &definition)?;
             let end_head = context.git.text(
                 &record.path,
                 InternalGitProfile::Discovery,
@@ -1321,7 +1453,8 @@ impl Application {
                     &record.path,
                 )?
                 .review_clean();
-            let passed = output.status.success() && !stale;
+            let passed =
+                process.status.success() && !stale && !process.timed_out && !process.output_limited;
             if definition.required && !passed {
                 required_failure = true;
             }
@@ -1340,22 +1473,20 @@ impl Application {
                 },
                 command_json: serde_json::to_string(&definition.command)?,
             })?;
-            results.push(serde_json::json!({ "name": definition.name, "required": definition.required, "exit_code": output.status.code(), "passed": passed, "stale": stale, "head_oid": start_head.clone(), "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr) }));
+            results.push(serde_json::json!({
+                "name": definition.name,
+                "required": definition.required,
+                "exit_code": process.status.code(),
+                "passed": passed,
+                "stale": stale,
+                "timed_out": process.timed_out,
+                "output_limited": process.output_limited,
+                "head_oid": start_head.clone(),
+                "stdout": String::from_utf8_lossy(&process.stdout),
+                "stderr": String::from_utf8_lossy(&process.stderr),
+            }));
         }
-        output(
-            json,
-            "check",
-            None,
-            &serde_json::json!({ "task_id": record.id, "results": results }),
-        )?;
-        if required_failure {
-            return Err(AppError::diagnostic(
-                "AGT-0726",
-                "a required check failed or became stale",
-                ErrorKind::StateInconsistent,
-            ));
-        }
-        Ok(0)
+        Ok((results, required_failure))
     }
 
     fn fetch(context: &Context, remote: &str, json: bool) -> Result<i32, AppError> {
@@ -1806,13 +1937,11 @@ impl Application {
                 .as_path(),
         )?;
         let record = state.task(&task_id)?;
-        if std::env::var("AGENTREE_SESSION_ID").is_ok()
-            && raw.first().is_some_and(|arg| {
-                matches!(
-                    arg.to_string_lossy().as_ref(),
-                    "new" | "remove" | "fetch" | "sync" | "land" | "doctor" | "agentree"
-                )
-            })
+        if is_administrative_shim_command(&raw)
+            && (std::env::var_os("AGENTREE_SESSION_ID").is_some()
+                || current_process_group()
+                    .and_then(|pgid| state.active_session_for_process_group(pgid).ok().flatten())
+                    .is_some())
         {
             return Err(AppError::diagnostic(
                 "AGT-0742",
@@ -2014,6 +2143,173 @@ fn process_birth_identity(pid: u32) -> String {
     "unavailable".to_owned()
 }
 
+fn spawn_session_child(
+    context: &Context,
+    record: &TaskRecord,
+    arguments: &RunArgs,
+    session_id: &str,
+) -> Result<Child, AppError> {
+    let session_root = PathBuf::from(&context.manifest.state_dir)
+        .join("sessions")
+        .join(session_id);
+    let shim_dir = session_root.join("bin");
+    fs::create_dir_all(&shim_dir)?;
+    let executable = std::env::current_exe()?;
+    let shim = shim_dir.join("git");
+    create_link_or_copy(&executable, &shim)?;
+    let mut command = Command::new(&arguments.program[0]);
+    command.args(arguments.program.iter().skip(1));
+    command.current_dir(&record.path);
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    sanitize_child_environment(&mut command);
+    command.env("AGENTREE_SESSION_ID", session_id);
+    command.env("AGENTREE_TASK_ID", &record.id);
+    command.env("AGENTREE_REPOSITORY_ID", &context.manifest.repository_id);
+    command.env("AGENTREE_CONFIG_HASH", &record.config_hash);
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![shim_dir.clone()];
+    paths.extend(std::env::split_paths(&old_path).filter(|path| path != &shim_dir));
+    command.env(
+        "PATH",
+        std::env::join_paths(paths).map_err(|_| {
+            AppError::diagnostic("AGT-0705", "cannot construct child PATH", ErrorKind::Io)
+        })?,
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    Ok(command.spawn()?)
+}
+
+fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+struct BoundedCheckOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+    output_limited: bool,
+}
+
+fn run_bounded_check(
+    worktree: &Path,
+    definition: &config::CheckDefinition,
+) -> Result<BoundedCheckOutput, AppError> {
+    let mut command = Command::new(&definition.command[0]);
+    command.args(definition.command.iter().skip(1));
+    command.current_dir(worktree);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    sanitize_child_environment(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        AppError::diagnostic(
+            "AGT-0751",
+            "check stdout pipe was not created",
+            ErrorKind::Io,
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        AppError::diagnostic(
+            "AGT-0752",
+            "check stderr pipe was not created",
+            ErrorKind::Io,
+        )
+    })?;
+    let output_limited = Arc::new(AtomicBool::new(false));
+    let stdout_limited = Arc::clone(&output_limited);
+    let stderr_limited = Arc::clone(&output_limited);
+    let output_limit = definition.output_limit_bytes;
+    let stdout_handle = thread::spawn(move || read_limited(stdout, output_limit, stdout_limited));
+    let stderr_handle = thread::spawn(move || read_limited(stderr, output_limit, stderr_limited));
+    let deadline = Instant::now() + Duration::from_secs(definition.timeout_seconds);
+    let mut timed_out = false;
+    let status = loop {
+        if output_limited.load(Ordering::Acquire) {
+            terminate_child(&mut child);
+            break child.wait()?;
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            terminate_child(&mut child);
+            break child.wait()?;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_handle.join().map_err(|_| {
+        AppError::diagnostic("AGT-0753", "check stdout reader failed", ErrorKind::Io)
+    })?;
+    let stderr = stderr_handle.join().map_err(|_| {
+        AppError::diagnostic("AGT-0754", "check stderr reader failed", ErrorKind::Io)
+    })?;
+    Ok(BoundedCheckOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+        output_limited: output_limited.load(Ordering::Acquire),
+    })
+}
+
+fn read_limited<R: Read>(mut reader: R, limit: usize, output_limited: Arc<AtomicBool>) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = limit.saturating_sub(output.len());
+                output.extend_from_slice(&buffer[..read.min(remaining)]);
+                if read > remaining {
+                    output_limited.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+    }
+    output
+}
+
 fn create_link_or_copy(source: &Path, target: &Path) -> Result<(), AppError> {
     #[cfg(unix)]
     {
@@ -2055,11 +2351,8 @@ fn deny_inside_session() -> Result<(), AppError> {
     Ok(())
 }
 
-fn deny_administrative_command_in_session(command: &CliCommand) -> Result<(), AppError> {
-    if std::env::var_os("AGENTREE_SESSION_ID").is_none() {
-        return Ok(());
-    }
-    let denied = matches!(
+fn is_administrative_command(command: &CliCommand) -> bool {
+    matches!(
         command,
         CliCommand::Init
             | CliCommand::Config { .. }
@@ -2075,8 +2368,58 @@ fn deny_administrative_command_in_session(command: &CliCommand) -> Result<(), Ap
             | CliCommand::Sync(_)
             | CliCommand::Resolve { .. }
             | CliCommand::Land(_)
-    );
-    if denied {
+    )
+}
+
+fn is_administrative_shim_command(arguments: &[OsString]) -> bool {
+    arguments.first().is_some_and(|argument| {
+        matches!(
+            argument.to_string_lossy().as_ref(),
+            "new" | "remove" | "fetch" | "sync" | "land" | "doctor" | "agentree"
+        )
+    })
+}
+
+fn current_process_group() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        let pgid = unsafe { libc::getpgrp() };
+        (pgid > 0).then_some(pgid as u32)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn enforce_session_guard(
+    git: &GitRunner,
+    facts: &RepositoryFacts,
+    command: &CliCommand,
+) -> Result<(), AppError> {
+    if !is_administrative_command(command) {
+        return Ok(());
+    }
+    let manifest = match repository::load_manifest(facts) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            if std::env::var_os("AGENTREE_SESSION_ID").is_some() {
+                return Err(AppError::diagnostic(
+                    "AGT-0747",
+                    "administrative Agentree command is denied inside a task session",
+                    ErrorKind::SessionGuardDenied,
+                ));
+            }
+            let _ = (git, error);
+            return Ok(());
+        }
+    };
+    let state = State::open(&PathBuf::from(&manifest.state_dir).join("state.sqlite3"))?;
+    let active = current_process_group()
+        .map(|pgid| state.active_session_for_process_group(pgid))
+        .transpose()?
+        .flatten();
+    if active.is_some() || std::env::var_os("AGENTREE_SESSION_ID").is_some() {
         return Err(AppError::diagnostic(
             "AGT-0747",
             "administrative Agentree command is denied inside a verified task session",

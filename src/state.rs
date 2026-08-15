@@ -119,6 +119,22 @@ impl State {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn has_incomplete_operation_for_task(&self, task_id: &str) -> Result<bool, AppError> {
+        let connection = self.connection.lock().map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0301",
+                "state lock poisoned",
+                crate::domain::ErrorKind::Database,
+            )
+        })?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE task_id=?1 AND status NOT IN ('completed','failed')",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn operation(&self, id: &str) -> Result<OperationRecord, AppError> {
         let connection = self.connection.lock().map_err(|_| {
             AppError::diagnostic(
@@ -285,6 +301,27 @@ impl State {
             params![task_id],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn active_session_for_process_group(
+        &self,
+        pgid: u32,
+    ) -> Result<Option<(String, String)>, AppError> {
+        let connection = self.connection.lock().map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0301",
+                "state lock poisoned",
+                crate::domain::ErrorKind::Database,
+            )
+        })?;
+        connection
+            .query_row(
+                "SELECT id, task_id FROM sessions WHERE pgid=?1 AND status IN ('starting','running') ORDER BY started_at LIMIT 1",
+                params![pgid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(AppError::from)
     }
 
     pub fn start_session(&self, task_id: &str, pid: u32, pgid: u32) -> Result<String, AppError> {

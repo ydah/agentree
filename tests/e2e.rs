@@ -378,3 +378,133 @@ fn required_checks_are_bound_to_exact_head_and_make_readiness_derived() {
     let stale_value: Value = serde_json::from_slice(&stale.stdout).expect("stale status JSON");
     assert_eq!(stale_value["result"][0]["ready"], Value::Bool(false));
 }
+
+#[test]
+fn failed_session_spawn_does_not_poison_the_task() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "orphan"]).status.success());
+
+    let failed = run(
+        repo.path(),
+        &[
+            "run",
+            "orphan",
+            "--",
+            "/definitely/missing-agentree-program",
+        ],
+    );
+    assert!(!failed.status.success());
+
+    let status = run(repo.path(), &["status", "--json"]);
+    let envelope: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(envelope["result"][0]["session"], 0);
+
+    let retry = run(repo.path(), &["run", "orphan", "--", "sh", "-c", "exit 0"]);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+}
+
+#[test]
+fn required_post_checks_change_run_result() {
+    let repo = fixture();
+    fs::write(
+        repo.path().join(".agentree.toml"),
+        "[[checks]]\nname = \"must-fail\"\ncommand = [\"sh\", \"-c\", \"exit 7\"]\nrequired = true\n",
+    )
+    .expect("config");
+    assert!(git(repo.path(), &["add", ".agentree.toml"])
+        .status
+        .success());
+    assert!(git(repo.path(), &["commit", "-qm", "config"])
+        .status
+        .success());
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "post-check"]).status.success());
+
+    let result = run(
+        repo.path(),
+        &[
+            "--json",
+            "run",
+            "post-check",
+            "--require-post-checks",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("AGT-0750"));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("required_failure"));
+}
+
+#[test]
+fn session_guard_uses_process_group_after_environment_is_cleared() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "parent"]).status.success());
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_agentree"));
+    let script = format!(
+        "unset AGENTREE_SESSION_ID AGENTREE_TASK_ID; exec {} --repository {} new escaped",
+        binary.display(),
+        repo.path().display()
+    );
+    let result = run(repo.path(), &["run", "parent", "--", "sh", "-c", &script]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("AGT-0747"));
+
+    let status = run(repo.path(), &["status", "--json"]);
+    let envelope: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(envelope["result"].as_array().expect("tasks").len(), 1);
+}
+
+#[test]
+fn removed_task_branch_can_be_deleted_with_expected_oid() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    let created = run(repo.path(), &["new", "deletable", "--json"]);
+    let envelope: Value = serde_json::from_slice(&created.stdout).expect("new JSON");
+    let branch = envelope["result"]["branch"].as_str().expect("branch");
+    assert!(run(repo.path(), &["remove", "deletable"]).status.success());
+
+    let deleted = run(
+        repo.path(),
+        &["delete-branch", "deletable", "--yes", "--json"],
+    );
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(!git(repo.path(), &["show-ref", "--verify", branch])
+        .status
+        .success());
+}
+
+#[test]
+fn checks_enforce_timeout_and_report_the_failure() {
+    let repo = fixture();
+    fs::write(
+        repo.path().join(".agentree.toml"),
+        "[[checks]]\nname = \"timeout\"\ncommand = [\"sh\", \"-c\", \"sleep 2\"]\ntimeout_seconds = 1\noutput_limit_bytes = 1024\nrequired = true\n",
+    )
+    .expect("config");
+    assert!(git(repo.path(), &["add", ".agentree.toml"])
+        .status
+        .success());
+    assert!(git(repo.path(), &["commit", "-qm", "config"])
+        .status
+        .success());
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "timeout"]).status.success());
+
+    let result = run(repo.path(), &["check", "timeout", "--json"]);
+    assert!(!result.status.success());
+    let envelope: Value = serde_json::from_slice(&result.stdout).expect("check JSON");
+    assert_eq!(envelope["result"]["results"][0]["timed_out"], true);
+}

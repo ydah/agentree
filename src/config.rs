@@ -22,6 +22,18 @@ pub struct CheckDefinition {
     pub command: Vec<String>,
     #[serde(default)]
     pub required: bool,
+    #[serde(default = "default_check_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_check_output_limit_bytes")]
+    pub output_limit_bytes: usize,
+}
+
+fn default_check_timeout_seconds() -> u64 {
+    1800
+}
+
+fn default_check_output_limit_bytes() -> usize {
+    8 * 1024 * 1024
 }
 
 pub fn snapshot(git: &GitRunner, root: &Path, base_oid: &str) -> Result<ConfigSnapshot, AppError> {
@@ -92,11 +104,12 @@ fn parse_checks(value: Option<&serde_json::Value>) -> Result<Vec<CheckDefinition
                 .to_owned();
             let command = object
                 .get("command")
+                .or_else(|| object.get("argv"))
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| {
                     AppError::diagnostic(
                         "AGT-0406",
-                        "check.command must be an argv array",
+                        "check.command or check.argv must be an argv array",
                         ErrorKind::Usage,
                     )
                 })?
@@ -118,6 +131,28 @@ fn parse_checks(value: Option<&serde_json::Value>) -> Result<Vec<CheckDefinition
                     ErrorKind::Usage,
                 ));
             }
+            let timeout_seconds = object
+                .get("timeout_seconds")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(default_check_timeout_seconds() as i64);
+            if timeout_seconds <= 0 {
+                return Err(AppError::diagnostic(
+                    "AGT-0409",
+                    "check.timeout_seconds must be positive",
+                    ErrorKind::Usage,
+                ));
+            }
+            let output_limit_bytes = object
+                .get("output_limit_bytes")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(default_check_output_limit_bytes() as i64);
+            if output_limit_bytes <= 0 {
+                return Err(AppError::diagnostic(
+                    "AGT-0410",
+                    "check.output_limit_bytes must be positive",
+                    ErrorKind::Usage,
+                ));
+            }
             Ok(CheckDefinition {
                 name,
                 command,
@@ -125,6 +160,8 @@ fn parse_checks(value: Option<&serde_json::Value>) -> Result<Vec<CheckDefinition
                     .get("required")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                timeout_seconds: timeout_seconds as u64,
+                output_limit_bytes: output_limit_bytes as usize,
             })
         })
         .collect()
