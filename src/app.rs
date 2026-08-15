@@ -825,6 +825,91 @@ impl Application {
         let record = context.state.task(task_id)?;
         let _task_lock = task_lock(&context.manifest, task_id)?;
         match operation.kind.as_str() {
+            "checkpoint" => {
+                let observed: serde_json::Value = serde_json::from_str(&operation.observed)?;
+                let field = |name: &str| {
+                    observed[name].as_str().ok_or_else(|| {
+                        AppError::diagnostic(
+                            "AGT-0762",
+                            format!("checkpoint recovery lacks {name}"),
+                            ErrorKind::RecoveryRequired,
+                        )
+                    })
+                };
+                let checkpoint_id = field("checkpoint_id")?;
+                let metadata_oid = field("metadata_oid")?;
+                let immutable = field("immutable_ref")?;
+                let latest = observed["latest_ref"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "refs/agentree/checkpoints/{}/{}/latest",
+                            context.manifest.repository_id, task_id
+                        )
+                    });
+                let immutable_oid = context.git.text(
+                    &context.facts.root,
+                    InternalGitProfile::Discovery,
+                    &args2(&["rev-parse", "--verify", immutable]),
+                )?;
+                if immutable_oid != metadata_oid {
+                    return Err(AppError::diagnostic(
+                        "AGT-0763",
+                        "checkpoint immutable ref does not match the recorded metadata OID",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                match context.git.text(
+                    &context.facts.root,
+                    InternalGitProfile::Discovery,
+                    &args2(&["rev-parse", "--verify", &latest]),
+                ) {
+                    Ok(latest_oid) if latest_oid != metadata_oid => {
+                        return Err(AppError::diagnostic(
+                            "AGT-0763",
+                            "checkpoint latest ref does not match the recorded metadata OID",
+                            ErrorKind::RecoveryRequired,
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        context.git.run(
+                            &context.facts.root,
+                            InternalGitProfile::RepairReadOnly,
+                            &args(&["update-ref", &latest, metadata_oid]),
+                        )?;
+                    }
+                }
+                if !context
+                    .state
+                    .checkpoints(task_id)?
+                    .iter()
+                    .any(|checkpoint| checkpoint.id == checkpoint_id)
+                {
+                    context.state.save_checkpoint(&CheckpointRecord {
+                        id: checkpoint_id.to_owned(),
+                        task_id: task_id.to_owned(),
+                        head_oid: field("head_oid")?.to_owned(),
+                        index_tree_oid: field("index_tree_oid")?.to_owned(),
+                        worktree_tree_oid: field("worktree_tree_oid")?.to_owned(),
+                        metadata_oid: metadata_oid.to_owned(),
+                        message: None,
+                        config_hash: field("config_hash")?.to_owned(),
+                    })?;
+                }
+                context.state.update_operation(
+                    id,
+                    OperationStatus::Completed,
+                    &serde_json::json!({
+                        "phase": "reconciled",
+                        "checkpoint_id": checkpoint_id,
+                        "metadata_oid": metadata_oid,
+                        "latest_ref": latest,
+                    })
+                    .to_string(),
+                )?;
+            }
             "land" => {
                 let _repo_lock = repo_lock(&context.manifest)?;
                 let target_ref = expected["target_ref"].as_str().ok_or_else(|| {
@@ -852,6 +937,57 @@ impl Application {
                         "target is not at the recorded successful task OID; rollback is forbidden",
                         ErrorKind::RecoveryRequired,
                     ));
+                }
+                let observed_state: serde_json::Value =
+                    serde_json::from_str(&operation.observed).unwrap_or_default();
+                if let Some(landing_path) = observed_state["landing_path"].as_str() {
+                    let landing_path = PathBuf::from(landing_path);
+                    let landing_root = PathBuf::from(&context.manifest.state_dir).join("landing");
+                    let canonical_landing = landing_path.canonicalize().map_err(|_| {
+                        AppError::diagnostic(
+                            "AGT-0772",
+                            "land recovery worktree path cannot be verified",
+                            ErrorKind::RecoveryRequired,
+                        )
+                    })?;
+                    if !canonical_landing.starts_with(&landing_root) {
+                        return Err(AppError::diagnostic(
+                            "AGT-0773",
+                            "land recovery path is outside the managed landing root",
+                            ErrorKind::RecoveryRequired,
+                        ));
+                    }
+                    let landing_facts = repository::discover(&context.git, &landing_path)?;
+                    if !task::content_state(&context.git, &landing_facts, &landing_path)?
+                        .mutation_pristine()
+                    {
+                        let _ = context.state.update_operation(
+                            id,
+                            OperationStatus::CleanupPending,
+                            "{\"phase\":\"cleanup_pending\",\"reason\":\"landing_worktree_dirty\"}",
+                        );
+                        return Err(AppError::diagnostic(
+                            "AGT-0774",
+                            "land target updated but temporary landing worktree is dirty",
+                            ErrorKind::RecoveryRequired,
+                        ));
+                    }
+                    context.git.run(
+                        &context.facts.root,
+                        InternalGitProfile::WorktreeManagement,
+                        &[
+                            OsString::from("worktree"),
+                            OsString::from("remove"),
+                            landing_path.as_os_str().to_owned(),
+                        ],
+                    )?;
+                    if landing_path.exists() {
+                        return Err(AppError::diagnostic(
+                            "AGT-0775",
+                            "temporary landing worktree cleanup did not complete",
+                            ErrorKind::RecoveryRequired,
+                        ));
+                    }
                 }
                 context
                     .state
@@ -881,6 +1017,116 @@ impl Application {
                     id,
                     OperationStatus::Completed,
                     "{\"phase\":\"finalized_after_fact_match\"}",
+                )?;
+            }
+            "restore_checkpoint" => {
+                let expected: serde_json::Value = serde_json::from_str(&operation.expected)?;
+                if !record.path.exists() {
+                    return Err(AppError::diagnostic(
+                        "AGT-0764",
+                        "restored worktree is missing; recovery will not recreate it implicitly",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                let expected_branch = expected["branch"].as_str().ok_or_else(|| {
+                    AppError::diagnostic(
+                        "AGT-0765",
+                        "restore operation lacks branch",
+                        ErrorKind::RecoveryRequired,
+                    )
+                })?;
+                if record.branch != expected_branch {
+                    return Err(AppError::diagnostic(
+                        "AGT-0766",
+                        "restore branch does not match the journal",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                task::facts_match(&context.git, &record)?;
+                let facts = task_facts(&context.git, &record, &context.facts)?;
+                let restored_state = task::content_state(&context.git, &facts, &record.path)?;
+                if !restored_state.nonignored_residue.is_empty()
+                    || !restored_state.ignored_residue.is_empty()
+                    || !restored_state.visibility_flags.is_empty()
+                    || restored_state.in_progress
+                {
+                    return Err(AppError::diagnostic(
+                        "AGT-0767",
+                        "restored worktree facts are not safe to reconcile",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                let marker = task::marker_path(&context.git, &record.path)?;
+                if marker.exists() {
+                    verify_marker(context, &record)?;
+                } else {
+                    repository::durable_replace(
+                        &marker,
+                        &serde_json::to_vec(&serde_json::json!({
+                            "schema_version": 1,
+                            "repository_id": context.manifest.repository_id,
+                            "task_id": record.id.clone(),
+                            "branch": record.branch.clone(),
+                            "worktree": record.path.clone(),
+                            "restored_from": expected["restore_from"].clone(),
+                        }))?,
+                    )?;
+                }
+                let config = match context.state.config(task_id) {
+                    Ok(config) => config,
+                    Err(_) => {
+                        let restore_from = expected["restore_from"].as_str().ok_or_else(|| {
+                            AppError::diagnostic(
+                                "AGT-0776",
+                                "restore operation lacks source checkpoint",
+                                ErrorKind::RecoveryRequired,
+                            )
+                        })?;
+                        let source_task_id = context
+                            .state
+                            .tasks()?
+                            .into_iter()
+                            .find(|task| {
+                                context
+                                    .state
+                                    .checkpoints(&task.id)
+                                    .map(|checkpoints| {
+                                        checkpoints
+                                            .iter()
+                                            .any(|checkpoint| checkpoint.id == restore_from)
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .map(|task| task.id)
+                            .ok_or_else(|| {
+                                AppError::diagnostic(
+                                    "AGT-0777",
+                                    "restore source task cannot be identified",
+                                    ErrorKind::RecoveryRequired,
+                                )
+                            })?;
+                        let source_config = context.state.config(&source_task_id)?;
+                        context.state.save_config(task_id, &source_config)?;
+                        source_config
+                    }
+                };
+                if config.hash != expected["config_hash"].as_str().unwrap_or_default() {
+                    return Err(AppError::diagnostic(
+                        "AGT-0768",
+                        "restored config snapshot does not match the journal",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                context.state.update_task_lifecycle(
+                    task_id,
+                    Lifecycle::Active,
+                    Some(&record.head_oid),
+                    None,
+                )?;
+                context.state.update_operation(
+                    id,
+                    OperationStatus::Completed,
+                    "{\"phase\":\"reconciled\"}",
                 )?;
             }
             "archive" => {
@@ -1072,6 +1318,11 @@ impl Application {
             Some(&record.id),
             &serde_json::json!({ "head": record.head_oid, "index": facts.index_path }).to_string(),
         )?;
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Executing,
+            "{\"phase\":\"capture_started\"}",
+        )?;
         let tmp_root = PathBuf::from(&context.manifest.state_dir).join("tmp");
         fs::create_dir_all(&tmp_root)?;
         let frozen = tmp_root.join(format!("index-{}", operation.id));
@@ -1180,19 +1431,51 @@ impl Application {
             "refs/agentree/checkpoints/{}/{}/{}",
             context.manifest.repository_id, record.id, checkpoint_id
         );
+        let latest = format!(
+            "refs/agentree/checkpoints/{}/{}/latest",
+            context.manifest.repository_id, record.id
+        );
+        let mut observation = serde_json::json!({
+            "phase": "objects_created",
+            "checkpoint_id": checkpoint_id.clone(),
+            "task_id": record.id.clone(),
+            "head_oid": record.head_oid.clone(),
+            "index_tree_oid": index_tree.clone(),
+            "worktree_tree_oid": tree_one.clone(),
+            "metadata_oid": metadata_oid.clone(),
+            "config_hash": record.config_hash.clone(),
+            "immutable_ref": immutable.clone(),
+            "latest_ref": latest.clone(),
+        });
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Verifying,
+            &observation.to_string(),
+        )?;
         context.git.run(
             &facts.root,
             InternalGitProfile::RepairReadOnly,
             &args(&["update-ref", &immutable, &metadata_oid]),
         )?;
-        let latest = format!(
-            "refs/agentree/checkpoints/{}/{}/latest",
-            context.manifest.repository_id, record.id
-        );
+        failpoint("checkpoint.after_anchor_ref");
+        observation["phase"] = serde_json::Value::String("immutable_ref_published".to_owned());
+        observation["immutable_ref"] = serde_json::Value::String(immutable.clone());
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Verifying,
+            &observation.to_string(),
+        )?;
         context.git.run(
             &facts.root,
             InternalGitProfile::RepairReadOnly,
             &args(&["update-ref", &latest, &metadata_oid]),
+        )?;
+        observation["phase"] = serde_json::Value::String("latest_ref_published".to_owned());
+        observation["latest_ref"] = serde_json::Value::String(latest.clone());
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Verifying,
+            &observation.to_string(),
         )?;
         let checkpoint = CheckpointRecord {
             id: checkpoint_id,
@@ -1253,16 +1536,35 @@ impl Application {
         };
         context.state.insert_task(&record)?;
         let operation = context.state.create_operation(
-            OperationKind::CreateTask,
+            OperationKind::RestoreCheckpoint,
             Some(&task_id),
-            &serde_json::json!({ "restore_from": checkpoint_id, "base_oid": source.head_oid })
-                .to_string(),
+            &serde_json::json!({
+                "restore_from": checkpoint_id,
+                "base_oid": source.head_oid,
+                "branch": branch,
+                "path": path,
+                "index_tree_oid": source.index_tree_oid,
+                "worktree_tree_oid": source.worktree_tree_oid,
+                "config_hash": source_task.config_hash,
+            })
+            .to_string(),
         )?;
         let _task_lock = task_lock(&context.manifest, &task_id)?;
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Executing,
+            &serde_json::json!({ "phase": "branch_creation_started", "restore_from": checkpoint_id }).to_string(),
+        )?;
         context.git.run(
             &context.facts.root,
             InternalGitProfile::WorktreeManagement,
             &args2(&["update-ref", &branch, &source.head_oid]),
+        )?;
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Executing,
+            &serde_json::json!({ "phase": "branch_created", "restore_from": checkpoint_id })
+                .to_string(),
         )?;
         context.git.run(
             &context.facts.root,
@@ -1273,6 +1575,12 @@ impl Application {
                 path.as_os_str().to_owned(),
                 OsString::from(branch.trim_start_matches("refs/heads/")),
             ],
+        )?;
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Executing,
+            &serde_json::json!({ "phase": "worktree_added", "restore_from": checkpoint_id })
+                .to_string(),
         )?;
         let mut env = BTreeMap::new();
         env.insert(
@@ -1295,6 +1603,13 @@ impl Application {
             &env,
             None,
         )?;
+        failpoint("restore.after_index_replace");
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Verifying,
+            &serde_json::json!({ "phase": "index_restored", "restore_from": checkpoint_id })
+                .to_string(),
+        )?;
         let facts = task_facts(&context.git, &record, &context.facts)?;
         let restored_state = task::content_state(&context.git, &facts, &path)?;
         if !restored_state.visibility_flags.is_empty()
@@ -1313,6 +1628,12 @@ impl Application {
             &serde_json::to_vec(
                 &serde_json::json!({ "schema_version": 1, "repository_id": context.manifest.repository_id, "task_id": task_id, "branch": branch, "worktree": path, "restored_from": checkpoint_id }),
             )?,
+        )?;
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Verifying,
+            &serde_json::json!({ "phase": "marker_written", "restore_from": checkpoint_id })
+                .to_string(),
         )?;
         context
             .state
@@ -1490,7 +1811,14 @@ impl Application {
     }
 
     fn fetch(context: &Context, remote: &str, json: bool) -> Result<i32, AppError> {
-        if remote.is_empty() || remote.contains('/') || remote.contains(char::is_whitespace) {
+        if remote.is_empty()
+            || remote.starts_with('-')
+            || remote.starts_with('.')
+            || remote.ends_with('.')
+            || remote.contains('/')
+            || remote.contains("..")
+            || remote.contains(char::is_whitespace)
+        {
             return Err(AppError::diagnostic(
                 "AGT-0727",
                 "invalid remote name",
@@ -1512,6 +1840,14 @@ impl Application {
             None,
             &serde_json::json!({ "remote": remote }).to_string(),
         )?;
+        let refs_before = ref_snapshot(&context.git, &context.facts.root)?;
+        let fetch_head = context.facts.git_dir.join("FETCH_HEAD");
+        let fetch_head_before = fs::read(&fetch_head).ok();
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Executing,
+            "{\"phase\":\"fetch_started\"}",
+        )?;
         let refspec = format!("+refs/heads/*:refs/remotes/{remote}/*");
         let args = vec![
             OsString::from("fetch"),
@@ -1525,6 +1861,42 @@ impl Application {
         context
             .git
             .run(&context.facts.root, InternalGitProfile::Fetch, &args)?;
+        let refs_after = ref_snapshot(&context.git, &context.facts.root)?;
+        let allowed_prefix = format!("refs/remotes/{remote}/");
+        let mut changed_refs = Vec::new();
+        let keys = refs_before
+            .keys()
+            .chain(refs_after.keys())
+            .collect::<std::collections::BTreeSet<_>>();
+        for reference in keys {
+            if !reference.starts_with(&allowed_prefix)
+                && refs_before.get(reference) != refs_after.get(reference)
+            {
+                changed_refs.push(reference.clone());
+            }
+        }
+        if !changed_refs.is_empty() || fs::read(&fetch_head).ok() != fetch_head_before {
+            let observed = serde_json::json!({
+                "phase": "unexpected_side_effect",
+                "changed_refs": changed_refs,
+                "fetch_head_changed": true,
+            });
+            let _ = context.state.update_operation(
+                &operation.id,
+                OperationStatus::ManualIntervention,
+                &observed.to_string(),
+            );
+            return Err(AppError::diagnostic(
+                "AGT-0769",
+                "fetch changed a ref or FETCH_HEAD outside the validated destination",
+                ErrorKind::RecoveryRequired,
+            ));
+        }
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Verifying,
+            "{\"phase\":\"refs_verified\"}",
+        )?;
         context.state.update_operation(
             &operation.id,
             OperationStatus::Completed,
@@ -1787,6 +2159,11 @@ impl Application {
             InternalGitProfile::RepairReadOnly,
             &args2(&["update-ref", &safety_target, &target_oid]),
         )?;
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Executing,
+            "{\"phase\":\"safety_refs_created\"}",
+        )?;
         if arguments.into_current {
             let current = repository::discover(&context.git, &std::env::current_dir()?)?;
             let current_branch_name = current
@@ -1814,6 +2191,13 @@ impl Application {
                 &current.root,
                 InternalGitProfile::Land,
                 &args2(&["merge", "--no-autostash", "--ff-only", &task_oid]),
+            )?;
+            failpoint("land.after_fast_forward");
+            context.state.update_operation(
+                &operation.id,
+                OperationStatus::Verifying,
+                &serde_json::json!({ "phase": "target_updated", "target_oid": task_oid })
+                    .to_string(),
             )?;
             context
                 .state
@@ -1853,6 +2237,15 @@ impl Application {
                 OsString::from(target_ref.trim_start_matches("refs/heads/")),
             ],
         )?;
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Executing,
+            &serde_json::json!({
+                "phase": "landing_worktree_added",
+                "landing_path": landing_path,
+            })
+            .to_string(),
+        )?;
         let landing_facts = repository::discover(&context.git, &landing_path)?;
         if !task::content_state(&context.git, &landing_facts, &landing_path)?.mutation_pristine() {
             return Err(AppError::diagnostic(
@@ -1865,6 +2258,12 @@ impl Application {
             &landing_path,
             InternalGitProfile::Land,
             &args2(&["merge", "--no-autostash", "--ff-only", &task_oid]),
+        )?;
+        failpoint("land.after_fast_forward");
+        context.state.update_operation(
+            &operation.id,
+            OperationStatus::Verifying,
+            &serde_json::json!({ "phase": "target_updated", "target_oid": task_oid, "landing_path": landing_path }).to_string(),
         )?;
         let landed_head = context.git.text(
             &landing_path,
@@ -2100,6 +2499,37 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn ref_snapshot(git: &GitRunner, root: &Path) -> Result<BTreeMap<String, String>, AppError> {
+    let output = git.run(
+        root,
+        InternalGitProfile::Discovery,
+        &args(&["for-each-ref", "--format=%(refname)%00%(objectname)%00"]),
+    )?;
+    let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut snapshot = BTreeMap::new();
+    for pair in fields.chunks(2) {
+        if pair.len() < 2 || pair[0].is_empty() {
+            continue;
+        }
+        let reference = String::from_utf8(pair[0].to_vec()).map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0770",
+                "Git returned a non-UTF-8 ref name",
+                ErrorKind::Unsupported,
+            )
+        })?;
+        let oid = String::from_utf8(pair[1].to_vec()).map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0771",
+                "Git returned a non-UTF-8 ref OID",
+                ErrorKind::Unsupported,
+            )
+        })?;
+        snapshot.insert(reference, oid);
+    }
+    Ok(snapshot)
+}
+
 fn ensure_index_unlocked(index: &Path) -> Result<(), AppError> {
     let lock = index.parent().unwrap_or(Path::new(".")).join(format!(
         "{}.lock",
@@ -2204,6 +2634,13 @@ fn terminate_child(child: &mut Child) {
         }
     }
     let _ = child.kill();
+}
+
+fn failpoint(name: &str) {
+    if std::env::var_os("AGENTREE_FAILPOINT").is_some_and(|value| value == name) {
+        eprintln!("agentree failpoint triggered: {name}");
+        std::process::exit(90);
+    }
 }
 
 struct BoundedCheckOutput {

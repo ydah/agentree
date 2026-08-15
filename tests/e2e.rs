@@ -44,6 +44,27 @@ fn run(repo: &Path, args: &[&str]) -> Output {
         .expect("agentree must run")
 }
 
+fn run_with_env(repo: &Path, key: &str, value: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_agentree"))
+        .arg("--repository")
+        .arg(repo)
+        .env(key, value)
+        .args(args)
+        .output()
+        .expect("agentree must run")
+}
+
+fn run_in_with_env(repo: &Path, key: &str, value: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_agentree"))
+        .current_dir(repo)
+        .arg("--repository")
+        .arg(repo)
+        .env(key, value)
+        .args(args)
+        .output()
+        .expect("agentree must run")
+}
+
 fn run_in(repo: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_agentree"))
         .current_dir(repo)
@@ -507,4 +528,159 @@ fn checks_enforce_timeout_and_report_the_failure() {
     assert!(!result.status.success());
     let envelope: Value = serde_json::from_slice(&result.stdout).expect("check JSON");
     assert_eq!(envelope["result"]["results"][0]["timed_out"], true);
+}
+
+#[test]
+fn doctor_reconciles_checkpoint_after_anchor_ref_failure() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "checkpoint"]).status.success());
+    let failed = run_with_env(
+        repo.path(),
+        "AGENTREE_FAILPOINT",
+        "checkpoint.after_anchor_ref",
+        &["checkpoint", "create", "checkpoint"],
+    );
+    assert_eq!(failed.status.code(), Some(90));
+
+    let doctor = run(repo.path(), &["doctor", "--json"]);
+    let envelope: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    let operation = envelope["result"]["operations"][0]["operation_id"]
+        .as_str()
+        .expect("operation id");
+    let fingerprint = envelope["result"]["operations"][0]["plan_fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let applied = run(
+        repo.path(),
+        &[
+            "doctor",
+            "--operation",
+            operation,
+            "--apply",
+            "--plan-fingerprint",
+            fingerprint,
+        ],
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let checkpoints = run(repo.path(), &["checkpoint", "list", "checkpoint", "--json"]);
+    let checkpoints: Value = serde_json::from_slice(&checkpoints.stdout).expect("checkpoint JSON");
+    assert_eq!(
+        checkpoints["result"].as_array().expect("checkpoints").len(),
+        1
+    );
+}
+
+#[test]
+fn doctor_reconciles_restore_after_index_replacement_failure() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "source"]).status.success());
+    let checkpoint = run(repo.path(), &["--json", "checkpoint", "source"]);
+    let checkpoint: Value = serde_json::from_slice(&checkpoint.stdout).expect("checkpoint JSON");
+    let checkpoint_id = checkpoint["result"]["id"].as_str().expect("checkpoint id");
+    let failed = run_in_with_env(
+        repo.path(),
+        "AGENTREE_FAILPOINT",
+        "restore.after_index_replace",
+        &[
+            "checkpoint",
+            "restore",
+            checkpoint_id,
+            "--to-new-task",
+            "recovered",
+        ],
+    );
+    assert_eq!(failed.status.code(), Some(90));
+
+    let doctor = run(repo.path(), &["doctor", "--json"]);
+    let envelope: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    let operation = envelope["result"]["operations"][0]["operation_id"]
+        .as_str()
+        .expect("operation id");
+    let fingerprint = envelope["result"]["operations"][0]["plan_fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let applied = run(
+        repo.path(),
+        &[
+            "doctor",
+            "--operation",
+            operation,
+            "--apply",
+            "--plan-fingerprint",
+            fingerprint,
+        ],
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let status = run(repo.path(), &["status", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(status["result"].as_array().expect("tasks").len(), 2);
+    assert!(status["result"]
+        .as_array()
+        .expect("tasks")
+        .iter()
+        .any(|task| task["slug"] == "recovered" && task["state"] == "active"));
+}
+
+#[test]
+fn doctor_reconciles_land_after_fast_forward_failure() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    assert!(run(repo.path(), &["new", "land", "--json"])
+        .status
+        .success());
+    let context = run(repo.path(), &["context", "land", "--json"]);
+    let context: Value = serde_json::from_slice(&context.stdout).expect("context JSON");
+    let worktree = PathBuf::from(context["result"]["worktree"].as_str().expect("worktree"));
+    fs::write(worktree.join("landed"), "landed\n").expect("landed file");
+    assert!(git(&worktree, &["add", "landed"]).status.success());
+    assert!(git(&worktree, &["commit", "-qm", "land"]).status.success());
+
+    let failed = run_in_with_env(
+        repo.path(),
+        "AGENTREE_FAILPOINT",
+        "land.after_fast_forward",
+        &["land", "land", "--into-current"],
+    );
+    assert_eq!(failed.status.code(), Some(90));
+
+    let doctor = run(repo.path(), &["doctor", "--json"]);
+    let envelope: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    let operation = envelope["result"]["operations"][0]["operation_id"]
+        .as_str()
+        .expect("operation id");
+    let fingerprint = envelope["result"]["operations"][0]["plan_fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let applied = run(
+        repo.path(),
+        &[
+            "doctor",
+            "--operation",
+            operation,
+            "--apply",
+            "--plan-fingerprint",
+            fingerprint,
+        ],
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let remaining = run(repo.path(), &["doctor", "--json"]);
+    let remaining: Value = serde_json::from_slice(&remaining.stdout).expect("doctor JSON");
+    assert!(remaining["result"]["operations"]
+        .as_array()
+        .expect("operations")
+        .is_empty());
 }

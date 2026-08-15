@@ -90,10 +90,17 @@ impl State {
                 crate::domain::ErrorKind::Database,
             )
         })?;
-        connection.execute(
-            "UPDATE operations SET status=?2, observed_json=?3 WHERE id=?1",
+        let changed = connection.execute(
+            "UPDATE operations SET status=?2, observed_json=?3, updated_at=strftime('%s','now') WHERE id=?1 AND status NOT IN ('completed','failed')",
             params![id, status.as_str(), observed],
         )?;
+        if changed != 1 {
+            return Err(AppError::diagnostic(
+                "AGT-0305",
+                "operation is missing or already terminal",
+                crate::domain::ErrorKind::RecoveryRequired,
+            ));
+        }
         Ok(())
     }
 
