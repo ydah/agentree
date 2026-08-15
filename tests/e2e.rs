@@ -276,6 +276,12 @@ fn sync_abort_recovers_a_real_rebase_conflict() {
     let status = run(repo.path(), &["status", "--json"]);
     let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
     assert_eq!(status["result"][0]["state"], "active");
+    let doctor = run(repo.path(), &["doctor", "--json"]);
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    assert!(doctor["result"]["operations"]
+        .as_array()
+        .expect("doctor operations")
+        .is_empty());
 }
 
 #[test]
@@ -302,6 +308,12 @@ fn sync_continue_recovers_a_resolved_rebase_conflict() {
     let status = run(repo.path(), &["status", "--json"]);
     let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
     assert_eq!(status["result"][0]["state"], "active");
+    let doctor = run(repo.path(), &["doctor", "--json"]);
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    assert!(doctor["result"]["operations"]
+        .as_array()
+        .expect("doctor operations")
+        .is_empty());
 }
 
 #[test]
