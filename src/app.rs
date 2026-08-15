@@ -2245,14 +2245,14 @@ impl Application {
             ));
         }
         let _task_lock = task_lock(&context.manifest, &record.id)?;
-        task::facts_match(&context.git, record)?;
-        if !rebase_in_progress(&context.git, &record.path)? {
-            return Err(AppError::diagnostic(
+        let rebase_state = rebase_state_dir(&context.git, &record.path)?.ok_or_else(|| {
+            AppError::diagnostic(
                 "AGT-0731",
                 "no rebase is in progress for this task",
                 ErrorKind::StateInconsistent,
-            ));
-        }
+            )
+        })?;
+        task::rebase_facts_match(record, &rebase_state)?;
         let operation = context
             .state
             .incomplete_operation_for_task_kind(&record.id, OperationKind::Sync.as_str())?
@@ -2743,10 +2743,16 @@ fn current_branch(git: &GitRunner, root: &Path) -> Result<String, AppError> {
     Ok(branch.trim_start_matches("refs/heads/").to_owned())
 }
 
-fn rebase_in_progress(git: &GitRunner, worktree: &Path) -> Result<bool, AppError> {
+fn rebase_state_dir(git: &GitRunner, worktree: &Path) -> Result<Option<PathBuf>, AppError> {
     let merge_dir = resolve_git_path(git, worktree, "rebase-merge")?;
+    if merge_dir.exists() {
+        return Ok(Some(merge_dir));
+    }
     let apply_dir = resolve_git_path(git, worktree, "rebase-apply")?;
-    Ok(merge_dir.exists() || apply_dir.exists())
+    if apply_dir.exists() {
+        return Ok(Some(apply_dir));
+    }
+    Ok(None)
 }
 
 fn sha256_file(path: &Path) -> Result<String, AppError> {

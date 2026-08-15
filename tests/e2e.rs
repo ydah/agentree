@@ -233,6 +233,77 @@ fn sync_rebases_only_the_task_against_an_exact_target() {
         .success());
 }
 
+fn start_conflicting_sync(repo: &Path) -> PathBuf {
+    assert!(run(repo, &["init"]).status.success());
+    let created = run(repo, &["new", "conflict", "--json"]);
+    assert!(created.status.success());
+    let worktree = result_path(&created);
+    fs::write(worktree.join("conflict.txt"), "task\n").expect("task conflict");
+    assert!(git(&worktree, &["add", "conflict.txt"]).status.success());
+    assert!(git(&worktree, &["commit", "-qm", "task-conflict"])
+        .status
+        .success());
+    fs::write(repo.join("conflict.txt"), "main\n").expect("main conflict");
+    assert!(git(repo, &["add", "conflict.txt"]).status.success());
+    assert!(git(repo, &["commit", "-qm", "main-conflict"])
+        .status
+        .success());
+    let started = run(repo, &["sync", "conflict", "--onto", "main"]);
+    assert!(!started.status.success());
+    assert!(String::from_utf8_lossy(&started.stderr).contains("conflict"));
+    worktree
+}
+
+#[test]
+fn sync_abort_recovers_a_real_rebase_conflict() {
+    let repo = fixture();
+    let worktree = start_conflicting_sync(repo.path());
+    let aborted = run(repo.path(), &["sync", "conflict", "--abort", "--json"]);
+    assert!(
+        aborted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&aborted.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&aborted.stdout).expect("abort JSON");
+    assert_eq!(envelope["ok"], true);
+    assert!(git(&worktree, &["symbolic-ref", "--short", "HEAD"])
+        .status
+        .success());
+    assert!(git(&worktree, &["diff", "--quiet"]).status.success());
+    assert!(git(&worktree, &["diff", "--cached", "--quiet"])
+        .status
+        .success());
+    let status = run(repo.path(), &["status", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(status["result"][0]["state"], "active");
+}
+
+#[test]
+fn sync_continue_recovers_a_resolved_rebase_conflict() {
+    let repo = fixture();
+    let worktree = start_conflicting_sync(repo.path());
+    fs::write(worktree.join("conflict.txt"), "resolved\n").expect("resolve conflict");
+    assert!(git(&worktree, &["add", "conflict.txt"]).status.success());
+    let continued = run(repo.path(), &["sync", "conflict", "--continue", "--json"]);
+    assert!(
+        continued.status.success(),
+        "{}",
+        String::from_utf8_lossy(&continued.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&continued.stdout).expect("continue JSON");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        fs::read_to_string(worktree.join("conflict.txt")).expect("resolved content"),
+        "resolved\n"
+    );
+    assert!(git(&worktree, &["symbolic-ref", "--short", "HEAD"])
+        .status
+        .success());
+    let status = run(repo.path(), &["status", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(status["result"][0]["state"], "active");
+}
+
 #[test]
 fn temporary_landing_worktree_updates_only_an_unclaimed_target() {
     let repo = fixture();

@@ -126,6 +126,42 @@ pub fn facts_match(git: &GitRunner, task: &TaskRecord) -> Result<(), AppError> {
     Ok(())
 }
 
+pub fn rebase_facts_match(task: &TaskRecord, rebase_state: &Path) -> Result<(), AppError> {
+    let branch = fs::read_to_string(rebase_state.join("head-name")).map_err(|error| {
+        AppError::diagnostic(
+            "AGT-0514",
+            format!("rebase state is missing its original branch: {error}"),
+            ErrorKind::RecoveryRequired,
+        )
+    })?;
+    if branch.trim() != task.branch {
+        return Err(AppError::diagnostic(
+            "AGT-0504",
+            "rebase state is not for the task's owned branch",
+            ErrorKind::StateInconsistent,
+        ));
+    }
+    let original_head = fs::read_to_string(rebase_state.join("orig-head")).map_err(|error| {
+        AppError::diagnostic(
+            "AGT-0515",
+            format!("rebase state is missing its original HEAD: {error}"),
+            ErrorKind::RecoveryRequired,
+        )
+    })?;
+    if original_head.trim() != task.head_oid {
+        return Err(AppError::diagnostic(
+            "AGT-0505",
+            format!(
+                "rebase started from an unexpected task HEAD (expected {}, observed {})",
+                task.head_oid,
+                original_head.trim()
+            ),
+            ErrorKind::StateInconsistent,
+        ));
+    }
+    Ok(())
+}
+
 pub fn content_state(
     git: &GitRunner,
     facts: &RepositoryFacts,
