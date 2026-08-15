@@ -126,7 +126,11 @@ pub fn facts_match(git: &GitRunner, task: &TaskRecord) -> Result<(), AppError> {
     Ok(())
 }
 
-pub fn rebase_facts_match(task: &TaskRecord, rebase_state: &Path) -> Result<(), AppError> {
+pub fn rebase_facts_match(
+    task: &TaskRecord,
+    rebase_state: &Path,
+    expected_target_oid: &str,
+) -> Result<(), AppError> {
     let branch = fs::read_to_string(rebase_state.join("head-name")).map_err(|error| {
         AppError::diagnostic(
             "AGT-0514",
@@ -155,6 +159,23 @@ pub fn rebase_facts_match(task: &TaskRecord, rebase_state: &Path) -> Result<(), 
                 "rebase started from an unexpected task HEAD (expected {}, observed {})",
                 task.head_oid,
                 original_head.trim()
+            ),
+            ErrorKind::StateInconsistent,
+        ));
+    }
+    let target_oid = fs::read_to_string(rebase_state.join("onto")).map_err(|error| {
+        AppError::diagnostic(
+            "AGT-0516",
+            format!("rebase state is missing its target OID: {error}"),
+            ErrorKind::RecoveryRequired,
+        )
+    })?;
+    if target_oid.trim() != expected_target_oid {
+        return Err(AppError::diagnostic(
+            "AGT-0517",
+            format!(
+                "rebase target changed (expected {expected_target_oid}, observed {})",
+                target_oid.trim()
             ),
             ErrorKind::StateInconsistent,
         ));

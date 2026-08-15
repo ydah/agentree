@@ -2270,7 +2270,6 @@ impl Application {
                 ErrorKind::StateInconsistent,
             )
         })?;
-        task::rebase_facts_match(record, &rebase_state)?;
         let operation = context
             .state
             .incomplete_operation_for_task_kind(&record.id, OperationKind::Sync.as_str())?
@@ -2281,6 +2280,15 @@ impl Application {
                     ErrorKind::RecoveryRequired,
                 )
             })?;
+        let expected: serde_json::Value = serde_json::from_str(&operation.expected)?;
+        let target_oid = expected["target_oid"].as_str().ok_or_else(|| {
+            AppError::diagnostic(
+                "AGT-0733",
+                "sync operation lacks its target OID",
+                ErrorKind::RecoveryRequired,
+            )
+        })?;
+        task::rebase_facts_match(record, &rebase_state, target_oid)?;
         context.state.update_operation(
             &operation.id,
             OperationStatus::Executing,
@@ -2307,7 +2315,11 @@ impl Application {
                     &record.id,
                     Lifecycle::Active,
                     Some(&head),
-                    None,
+                    if continue_rebase {
+                        Some(target_oid)
+                    } else {
+                        None
+                    },
                 )?;
                 context.state.update_operation(
                     &operation.id,

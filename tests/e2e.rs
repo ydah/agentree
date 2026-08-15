@@ -308,12 +308,50 @@ fn sync_continue_recovers_a_resolved_rebase_conflict() {
     let status = run(repo.path(), &["status", "--json"]);
     let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
     assert_eq!(status["result"][0]["state"], "active");
+    let context = run(repo.path(), &["context", "conflict", "--json"]);
+    let context: Value = serde_json::from_slice(&context.stdout).expect("context JSON");
+    let target =
+        String::from_utf8(git(repo.path(), &["rev-parse", "main"]).stdout).expect("target OID");
+    assert_eq!(context["result"]["base_oid"], target.trim());
     let doctor = run(repo.path(), &["doctor", "--json"]);
     let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
     assert!(doctor["result"]["operations"]
         .as_array()
         .expect("doctor operations")
         .is_empty());
+}
+
+#[test]
+fn sync_continuation_rejects_a_rebase_against_a_different_target() {
+    let repo = fixture();
+    let worktree = start_conflicting_sync(repo.path());
+    assert!(git(&worktree, &["rebase", "--abort"]).status.success());
+    fs::write(repo.path().join("target-b.txt"), "target-b\n").expect("target B");
+    assert!(git(repo.path(), &["add", "target-b.txt"]).status.success());
+    assert!(git(repo.path(), &["commit", "-qm", "target-b"])
+        .status
+        .success());
+    let base =
+        String::from_utf8(git(&worktree, &["rev-parse", "HEAD^"]).stdout).expect("rebase base");
+    let started = git(&worktree, &["rebase", "--onto", "main", base.trim()]);
+    assert!(!started.status.success());
+    fs::write(
+        worktree.join("conflict.txt"),
+        "resolved-under-different-target\n",
+    )
+    .expect("resolve different target");
+    assert!(git(&worktree, &["add", "conflict.txt"]).status.success());
+    let continued = run(repo.path(), &["sync", "conflict", "--continue", "--json"]);
+    assert!(!continued.status.success());
+    let envelope: Value = serde_json::from_slice(&continued.stdout).expect("continue JSON");
+    assert_eq!(envelope["ok"], false);
+    assert!(envelope["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("AGT-0517"));
+    let doctor = run(repo.path(), &["doctor", "--json"]);
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    assert_eq!(doctor["result"]["operations"].as_array().unwrap().len(), 1);
 }
 
 #[test]
