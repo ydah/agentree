@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: ${{ matrix.os }} / Rust stable
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Report toolchain and Git capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          git --version
+
+          fetch_help="$(git fetch -h 2>&1 || true)"
+          printf '%s\n' "$fetch_help"
+          for option in '--[no-]prune' '--[no-]tags' '--[no-]recurse-submodules' '--[no-]write-fetch-head'
+          do
+            grep -F -- "$option" <<<"$fetch_help"
+          done
+
+          rebase_help="$(git rebase -h 2>&1 || true)"
+          printf '%s\n' "$rebase_help"
+          for option in '--[no-]update-refs' '--[no-]autostash'
+          do
+            grep -F -- "$option" <<<"$rebase_help"
+          done
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-features
+
+      - name: Run documentation tests
+        run: cargo test --doc
