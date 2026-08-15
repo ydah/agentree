@@ -270,6 +270,7 @@ impl Application {
             );
             return Err(error);
         }
+        failpoint("task_create.after_worktree_add");
         context.state.update_operation(
             &operation.id,
             OperationStatus::Verifying,
@@ -324,6 +325,24 @@ impl Application {
         let tasks = context.state.tasks()?;
         let mut result = Vec::new();
         for record in &tasks {
+            if !record.path.exists() {
+                result.push(serde_json::json!({
+                    "task_id": record.id,
+                    "slug": record.slug,
+                    "state": record.lifecycle.as_str(),
+                    "branch": record.branch,
+                    "head": record.head_oid,
+                    "recorded_head": record.head_oid,
+                    "drifted": false,
+                    "worktree": record.path,
+                    "worktree_exists": false,
+                    "dirty": serde_json::Value::Null,
+                    "mutation_pristine": serde_json::Value::Null,
+                    "ready": false,
+                    "session": context.state.sessions_for_task(&record.id)?,
+                }));
+                continue;
+            }
             let facts = task_facts(&context.git, record, &context.facts)?;
             let content = task::content_state(&context.git, &facts, &record.path)?;
             let observed_head = context.git.text(
@@ -344,7 +363,7 @@ impl Application {
                         &definition_hash,
                         required_count,
                     )?);
-            result.push(serde_json::json!({ "task_id": record.id, "slug": record.slug, "state": record.lifecycle.as_str(), "branch": record.branch, "head": observed_head, "recorded_head": record.head_oid, "drifted": observed_head != record.head_oid, "worktree": record.path, "dirty": !content.review_clean(), "mutation_pristine": content.mutation_pristine(), "ready": ready, "session": context.state.sessions_for_task(&record.id)? }));
+            result.push(serde_json::json!({ "task_id": record.id, "slug": record.slug, "state": record.lifecycle.as_str(), "branch": record.branch, "head": observed_head, "recorded_head": record.head_oid, "drifted": observed_head != record.head_oid, "worktree": record.path, "worktree_exists": true, "dirty": !content.review_clean(), "mutation_pristine": content.mutation_pristine(), "ready": ready, "session": context.state.sessions_for_task(&record.id)? }));
         }
         if json {
             print_json("status", &result);
@@ -423,6 +442,16 @@ impl Application {
                 "AGT-0704",
                 "a session is already active for this task",
                 ErrorKind::LockConflict,
+            ));
+        }
+        if context
+            .state
+            .has_incomplete_operation_for_task(&record.id)?
+        {
+            return Err(AppError::diagnostic(
+                "AGT-0782",
+                "incomplete operation prevents removal",
+                ErrorKind::RecoveryRequired,
             ));
         }
         refresh_head(context, &mut record)?;
@@ -566,6 +595,16 @@ impl Application {
                 ErrorKind::LockConflict,
             ));
         }
+        if context
+            .state
+            .has_incomplete_operation_for_task(&record.id)?
+        {
+            return Err(AppError::diagnostic(
+                "AGT-0782",
+                "incomplete operation prevents removal",
+                ErrorKind::RecoveryRequired,
+            ));
+        }
         let managed_root = Path::new(&context.manifest.worktree_root).canonicalize()?;
         let candidate = record.path.canonicalize()?;
         if !candidate.starts_with(&managed_root) {
@@ -634,6 +673,16 @@ impl Application {
                 "AGT-0715",
                 "active session prevents archive",
                 ErrorKind::LockConflict,
+            ));
+        }
+        if context
+            .state
+            .has_incomplete_operation_for_task(&record.id)?
+        {
+            return Err(AppError::diagnostic(
+                "AGT-0783",
+                "incomplete operation prevents archive",
+                ErrorKind::RecoveryRequired,
             ));
         }
         let _task_lock = task_lock(&context.manifest, &record.id)?;
@@ -1012,7 +1061,67 @@ impl Application {
                 )?;
             }
             "create_task" => {
+                if !record.path.exists() {
+                    return Err(AppError::diagnostic(
+                        "AGT-0778",
+                        "created worktree is missing; recovery will not recreate it implicitly",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                let expected_path = expected["path"].as_str().ok_or_else(|| {
+                    AppError::diagnostic(
+                        "AGT-0779",
+                        "create operation lacks path",
+                        ErrorKind::RecoveryRequired,
+                    )
+                })?;
+                if record.path.to_str() != Some(expected_path) {
+                    return Err(AppError::diagnostic(
+                        "AGT-0780",
+                        "created worktree path does not match the journal",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
                 task::facts_match(&context.git, &record)?;
+                let facts = task_facts(&context.git, &record, &context.facts)?;
+                task::ensure_mutation_pristine(&context.git, &facts, &record.path)?;
+                let marker = task::marker_path(&context.git, &record.path)?;
+                if marker.exists() {
+                    verify_marker(context, &record)?;
+                } else {
+                    repository::durable_replace(
+                        &marker,
+                        &serde_json::to_vec(&serde_json::json!({
+                            "schema_version": 1,
+                            "repository_id": context.manifest.repository_id,
+                            "task_id": record.id.clone(),
+                            "branch": record.branch.clone(),
+                            "worktree": record.path.clone(),
+                        }))?,
+                    )?;
+                }
+                let config = match context.state.config(&record.id) {
+                    Ok(config) => config,
+                    Err(_) => {
+                        let config =
+                            config::snapshot(&context.git, &context.facts.root, &record.base_oid)?;
+                        context.state.save_config(&record.id, &config)?;
+                        config
+                    }
+                };
+                if config.hash != record.config_hash {
+                    return Err(AppError::diagnostic(
+                        "AGT-0781",
+                        "created task config snapshot does not match the journal",
+                        ErrorKind::RecoveryRequired,
+                    ));
+                }
+                context.state.update_task_lifecycle(
+                    &record.id,
+                    Lifecycle::Active,
+                    Some(&record.head_oid),
+                    None,
+                )?;
                 context.state.update_operation(
                     id,
                     OperationStatus::Completed,

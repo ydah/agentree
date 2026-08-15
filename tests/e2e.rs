@@ -492,6 +492,9 @@ fn removed_task_branch_can_be_deleted_with_expected_oid() {
     let envelope: Value = serde_json::from_slice(&created.stdout).expect("new JSON");
     let branch = envelope["result"]["branch"].as_str().expect("branch");
     assert!(run(repo.path(), &["remove", "deletable"]).status.success());
+    let status = run(repo.path(), &["status", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(status["result"][0]["worktree_exists"], false);
 
     let deleted = run(
         repo.path(),
@@ -573,6 +576,51 @@ fn doctor_reconciles_checkpoint_after_anchor_ref_failure() {
         checkpoints["result"].as_array().expect("checkpoints").len(),
         1
     );
+}
+
+#[test]
+fn doctor_reconciles_task_creation_after_worktree_add_failure() {
+    let repo = fixture();
+    assert!(run(repo.path(), &["init"]).status.success());
+    let failed = run_with_env(
+        repo.path(),
+        "AGENTREE_FAILPOINT",
+        "task_create.after_worktree_add",
+        &["new", "interrupted"],
+    );
+    assert_eq!(failed.status.code(), Some(90));
+
+    let doctor = run(repo.path(), &["doctor", "--json"]);
+    let envelope: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    let operation = envelope["result"]["operations"][0]["operation_id"]
+        .as_str()
+        .expect("operation id");
+    let fingerprint = envelope["result"]["operations"][0]["plan_fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let applied = run(
+        repo.path(),
+        &[
+            "doctor",
+            "--operation",
+            operation,
+            "--apply",
+            "--plan-fingerprint",
+            fingerprint,
+        ],
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let status = run(repo.path(), &["status", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert!(status["result"]
+        .as_array()
+        .expect("tasks")
+        .iter()
+        .any(|task| task["slug"] == "interrupted" && task["state"] == "active"));
 }
 
 #[test]

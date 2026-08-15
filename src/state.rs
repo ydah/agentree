@@ -46,6 +46,10 @@ impl State {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_meta(id, version) VALUES(1, 1)",
+            [],
+        )?;
         Ok(Self {
             path: path.to_path_buf(),
             connection: Mutex::new(connection),
@@ -67,6 +71,10 @@ impl State {
             )
         })?;
         connection.execute("INSERT INTO operations(id, kind, status, task_id, expected_json, observed_json) VALUES(?1, ?2, ?3, ?4, ?5, '{}')", params![id.0, kind.as_str(), OperationStatus::Prepared.as_str(), task_id, expected])?;
+        connection.execute(
+            "INSERT INTO operation_steps(operation_id, from_status, to_status, observed_json) VALUES(?1, NULL, ?2, '{}')",
+            params![id.0, OperationStatus::Prepared.as_str()],
+        )?;
         Ok(OperationRecord {
             id: id.0,
             kind: kind.as_str().to_owned(),
@@ -90,17 +98,35 @@ impl State {
                 crate::domain::ErrorKind::Database,
             )
         })?;
+        let from_status: String = connection
+            .query_row(
+                "SELECT status FROM operations WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AppError::diagnostic(
+                    "AGT-0305",
+                    "operation is missing",
+                    crate::domain::ErrorKind::RecoveryRequired,
+                )
+            })?;
         let changed = connection.execute(
-            "UPDATE operations SET status=?2, observed_json=?3, updated_at=strftime('%s','now') WHERE id=?1 AND status NOT IN ('completed','failed')",
-            params![id, status.as_str(), observed],
+            "UPDATE operations SET status=?2, observed_json=?3, updated_at=strftime('%s','now') WHERE id=?1 AND status=?4 AND status NOT IN ('completed','failed')",
+            params![id, status.as_str(), observed, from_status],
         )?;
         if changed != 1 {
             return Err(AppError::diagnostic(
                 "AGT-0305",
-                "operation is missing or already terminal",
+                "operation phase changed concurrently or is already terminal",
                 crate::domain::ErrorKind::RecoveryRequired,
             ));
         }
+        connection.execute(
+            "INSERT INTO operation_steps(operation_id, from_status, to_status, observed_json) VALUES(?1, ?2, ?3, ?4)",
+            params![id, from_status, status.as_str(), observed],
+        )?;
         Ok(())
     }
 
@@ -477,11 +503,13 @@ pub struct CheckRunRecord {
 }
 
 const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_meta(id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS repositories(id TEXT PRIMARY KEY, common_dir TEXT NOT NULL, state_dir TEXT NOT NULL, object_format TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, slug TEXT NOT NULL, branch_ref TEXT NOT NULL UNIQUE, worktree_path TEXT NOT NULL UNIQUE, base_oid TEXT NOT NULL, head_oid TEXT NOT NULL, lifecycle TEXT NOT NULL, config_hash TEXT NOT NULL, scopes_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS configs(task_id TEXT PRIMARY KEY REFERENCES tasks(id), hash TEXT NOT NULL, source_oid TEXT NOT NULL, snapshot_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), status TEXT NOT NULL, pid INTEGER, pgid INTEGER, birth_id TEXT, exit_code INTEGER, started_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), finished_at INTEGER);
 CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL, task_id TEXT REFERENCES tasks(id), expected_json TEXT NOT NULL, observed_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
+CREATE TABLE IF NOT EXISTS operation_steps(id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL REFERENCES operations(id), from_status TEXT, to_status TEXT NOT NULL, observed_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS checkpoints(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), head_oid TEXT NOT NULL, index_tree_oid TEXT NOT NULL, worktree_tree_oid TEXT NOT NULL, metadata_oid TEXT NOT NULL, message TEXT, config_hash TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS check_runs(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), head_oid TEXT NOT NULL, config_hash TEXT NOT NULL, definition_hash TEXT NOT NULL, status TEXT NOT NULL, command_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
