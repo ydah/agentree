@@ -19,7 +19,9 @@ fn git(repo: &Path, args: &[&str]) -> Output {
 
 fn fixture() -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    assert!(git(dir.path(), &["init", "-q"]).status.success());
+    assert!(git(dir.path(), &["init", "-q", "--initial-branch", "main"])
+        .status
+        .success());
     assert!(git(dir.path(), &["config", "user.name", "Agentree Test"])
         .status
         .success());
