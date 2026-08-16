@@ -1,31 +1,18 @@
 # Agentree
 
-[![CI](https://github.com/ydah/agentree/actions/workflows/ci.yml/badge.svg)](https://github.com/ydah/agentree/actions/workflows/ci.yml)
-[![actionlint](https://github.com/ydah/agentree/actions/workflows/actionlint.yml/badge.svg)](https://github.com/ydah/agentree/actions/workflows/actionlint.yml)
-[![zizmor](https://github.com/ydah/agentree/actions/workflows/zizmor.yml/badge.svg)](https://github.com/ydah/agentree/actions/workflows/zizmor.yml)
-
 A safety-oriented Rust CLI for running independent coding tasks in isolated Git
 worktrees.
 
-[Features](#features) · [Quick start](#quick-start) · [Commands](#commands) ·
-[Configuration](#configuration) · [Security boundary](#security-boundary) ·
-[Development](#development)
+[Key Features](#key-features) | [Usage](#usage) | [Install](#install) | [Configure](#configure) | [FAQ](#faq)
 
-Agentree turns one repository into a set of independently runnable,
-reviewable tasks. Every task gets its own branch, linked worktree, index, and
-configuration snapshot, while operations remain observable and recoverable.
+`agentree` keeps independent coding tasks isolated without making them share a
+working directory or Git index. Create a task, run it under a task-local Git
+policy, inspect its state, and land it through explicit, fast-forward-only
+operations.
 
-```text
-one repository
-├── main
-└── Agentree-managed tasks
-    ├── task branch
-    ├── linked worktree
-    ├── private index
-    └── immutable config snapshot
-```
+* * *
 
-## Features
+## Key Features
 
 ### Isolated task worktrees
 
@@ -60,19 +47,9 @@ Dirty worktrees are archived in place. `remove` only removes a residue-free
 managed worktree, and branch deletion is a separate explicit operation. There
 is no broad `--force` removal path.
 
-## Quick start
+## Usage
 
-### Install from source
-
-Requirements: Git and a Rust toolchain compatible with Rust 1.80 or newer.
-
-```bash
-git clone https://github.com/ydah/agentree.git
-cd agentree
-cargo install --path .
-```
-
-### Create and run a task
+### Quick Start
 
 Run these commands from an existing Git repository:
 
@@ -97,7 +74,7 @@ agentree delete-branch parser-error --yes
 is not checked out. If the target branch is already checked out, run
 `agentree land <task> --into-current` from that exact target worktree instead.
 
-## Commands
+### Commands
 
 Global options can be used before or after a command:
 
@@ -135,7 +112,7 @@ Global options can be used before or after a command:
 See the [full command reference](docs/command-reference.md) for lifecycle
 rules and recovery behavior.
 
-### Task lifecycle
+### Task Lifecycle
 
 | State | Meaning | Typical next action |
 | --- | --- | --- |
@@ -145,7 +122,45 @@ rules and recovery behavior.
 | `archived` | Task metadata is inactive; filesystem data is retained. | Inspect or clean manually, then remove when residue-free |
 | `broken` | Recovery or manual intervention is required. | `doctor` and the [recovery runbook](docs/runbooks/recovery.md) |
 
-## Configuration
+### Output for Automation
+
+Use `--json` when integrating Agentree with scripts or another coordinator:
+
+```bash
+agentree --json status
+agentree --json context parser-error
+agentree --json check parser-error
+```
+
+The JSON envelope includes the command, result or error, and operation details
+where applicable. Human-readable output remains the default for interactive
+use.
+
+* * *
+
+## Install
+
+### Build from Source
+
+Requirements: Git and a Rust toolchain compatible with Rust 1.80 or newer.
+
+```bash
+git clone https://github.com/ydah/agentree.git
+cd agentree
+cargo install --path .
+```
+
+### Development Build
+
+```bash
+cargo build
+cargo run -- --help
+cargo test --all-features
+```
+
+* * *
+
+## Configure
 
 `agentree config scaffold` creates `.agentree.toml` at the repository root.
 Checks are read from the exact task base commit when a task is created, so
@@ -172,7 +187,7 @@ Commands are argv arrays. Agentree does not perform shell interpolation for
 configured checks; use an explicit shell executable when shell behavior is
 intentional.
 
-## Common recipes
+## Recipes
 
 ### Rebase a task onto the latest target
 
@@ -216,20 +231,6 @@ agentree doctor --operation <operation-id> --apply \
 Never manually delete an unknown worktree, branch, ref, or dirty path while
 recovering an operation. See the [recovery runbook](docs/runbooks/recovery.md)
 for the complete procedure.
-
-## Output for automation
-
-Use `--json` when integrating Agentree with scripts or another coordinator:
-
-```bash
-agentree --json status
-agentree --json context parser-error
-agentree --json check parser-error
-```
-
-The JSON envelope includes the command, result or error, and operation details
-where applicable. Human-readable output remains the default for interactive
-use.
 
 ## Security boundary
 
