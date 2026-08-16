@@ -1,41 +1,210 @@
 # Agentree
 
-Agentree is a local Rust CLI for running independent coding tasks in isolated
-Git linked worktrees. Each task owns one branch, worktree, index, immutable
-configuration snapshot, and at most one supervised session.
+[![CI](https://github.com/ydah/agentree/actions/workflows/ci.yml/badge.svg)](https://github.com/ydah/agentree/actions/workflows/ci.yml)
+[![actionlint](https://github.com/ydah/agentree/actions/workflows/actionlint.yml/badge.svg)](https://github.com/ydah/agentree/actions/workflows/actionlint.yml)
+[![zizmor](https://github.com/ydah/agentree/actions/workflows/zizmor.yml/badge.svg)](https://github.com/ydah/agentree/actions/workflows/zizmor.yml)
 
-## Status
+A safety-oriented Rust CLI for running independent coding tasks in isolated Git
+worktrees.
 
-The current release implements the core isolation and recovery-oriented
-workflow: repository manifests, SQLite state with WAL/FULL durability,
-journaled task creation, strict task-local Git execution, sessions, dual-tree
-checkpoints, scope/overlap reporting, checks, fetch, sync, fast-forward land,
-archive, branch deletion, and read-only doctor diagnostics.
+[Features](#features) · [Quick start](#quick-start) · [Commands](#commands) ·
+[Configuration](#configuration) · [Security boundary](#security-boundary) ·
+[Development](#development)
+
+Agentree turns one repository into a set of independently runnable,
+reviewable tasks. Every task gets its own branch, linked worktree, index, and
+configuration snapshot, while operations remain observable and recoverable.
 
 ```text
-agentree init
-agentree new parser-error --base main --scope 'src/parser/**'
-agentree run parser-error -- cargo test
-agentree checkpoint create parser-error -m 'before integration'
-agentree check parser-error
-agentree land parser-error --onto main
-agentree remove parser-error
+one repository
+├── main
+└── Agentree-managed tasks
+    ├── task branch
+    ├── linked worktree
+    ├── private index
+    └── immutable config snapshot
 ```
 
-Agentree is a cooperative guardrail, not an operating-system sandbox. A
-process that bypasses the shim or directly edits Git metadata is outside the
-guarantee. Dirty worktrees are archived in place; v0.1 through v0.3 never
-delete dirty data and never expose a broad `--force` removal path.
+## Features
 
-## Build and test
+### Isolated task worktrees
+
+Create parallel tasks without sharing a working directory or index. Each task
+starts from an exact base commit and owns its generated branch and worktree.
+Planned scopes can be recorded to make likely overlaps visible before work
+begins.
+
+### Guarded task execution
+
+`agentree run` supervises a command inside the task worktree and exposes a
+task-local Git shim. The shim rejects repository overrides and disallowed
+history or network operations, helping tasks stay within their assigned
+boundary.
+
+### Durable operations and recovery
+
+Task creation, checkpoints, sync, landing, removal, and branch deletion are
+journaled. SQLite state, safety refs, deterministic Git profiles, and
+read-only, plan-first `doctor` diagnostics make interrupted operations
+inspectable instead of silently ambiguous.
+
+### Review-aware workflow
+
+Use `status`, `context`, `diff`, `check`, `overlap`, and `checkpoint` to keep
+task state explicit. Required checks are bound to the exact task HEAD and
+configuration snapshot before a task can be landed.
+
+### Conservative cleanup
+
+Dirty worktrees are archived in place. `remove` only removes a residue-free
+managed worktree, and branch deletion is a separate explicit operation. There
+is no broad `--force` removal path.
+
+## Quick start
+
+### Install from source
+
+Requirements: Git and a Rust toolchain compatible with Rust 1.80 or newer.
+
+```bash
+git clone https://github.com/ydah/agentree.git
+cd agentree
+cargo install --path .
+```
+
+### Create and run a task
+
+Run these commands from an existing Git repository:
+
+```bash
+agentree init
+
+agentree new parser-error --base main --scope 'src/parser/**'
+agentree status
+agentree context parser-error
+
+agentree run parser-error -- cargo test
+agentree check parser-error
+agentree diff parser-error
+agentree checkpoint create parser-error -m 'before integration'
+
+agentree land parser-error --onto main
+agentree remove parser-error
+agentree delete-branch parser-error --yes
+```
+
+`land --onto <branch>` uses a temporary managed worktree when the target branch
+is not checked out. If the target branch is already checked out, run
+`agentree land <task> --into-current` from that exact target worktree instead.
+
+## Commands
+
+Global options can be used before or after a command:
 
 ```text
+--json                   Emit machine-readable output where supported
+--quiet                  Suppress non-essential output
+--repository <path>      Resolve the repository from an explicit path
+```
+
+| Command | Purpose |
+| --- | --- |
+| `init` | Create the repository manifest, SQLite state, lock namespace, and managed worktree root. |
+| `config scaffold` | Create a root `.agentree.toml` without overwriting an existing file. |
+| `new <slug>` | Create a task from an exact base commit; accepts `--base` and repeated `--scope`. |
+| `status` | List managed tasks and their current lifecycle state. |
+| `context <task>` | Report task facts, checks, content state, and derived readiness. |
+| `diff <task>` | Show the task's review diff. |
+| `run <task> -- <argv...>` | Run one supervised command with the task-local Git environment. |
+| `shell <task>` | Open the task through the current shell under supervision. |
+| `git <task> -- <git-argv...>` | Run an allowed Git command in the task context. |
+| `checkpoint create/list/show/restore` | Capture or restore staged and worktree trees; restore always creates a new task. |
+| `overlap [<task>...]` | Report actual path intersections and planned-scope violations. This is not semantic conflict detection. |
+| `check <task>` | Run configuration-snapshotted checks and record exact revision provenance. |
+| `fetch [--remote <name>]` | Update validated remote-tracking refs with unsafe fetch side effects disabled. |
+| `sync <task> --onto <branch>` | Rebase a task onto an exact target OID; use `--continue` or `--abort` for recovery. |
+| `land <task> --onto <branch>` | Fast-forward a target branch through a managed temporary worktree. |
+| `land <task> --into-current` | Fast-forward the exact target worktree from its current directory. |
+| `archive <task>` | Archive task metadata while leaving filesystem data untouched. |
+| `remove <task>` | Remove only an exact residue-free worktree; the task branch remains. |
+| `delete-branch <task> --yes` | Separately delete an owned task branch after its worktree is gone. |
+| `doctor` | Diagnose operations or sessions; `--apply` requires a fresh plan fingerprint. |
+
+See the [full command reference](docs/command-reference.md) for lifecycle
+rules and recovery behavior.
+
+## Configuration
+
+`agentree config scaffold` creates `.agentree.toml` at the repository root.
+Checks are read from the exact task base commit when a task is created, so
+changing the working copy later does not silently change an existing task's
+validation contract. Commit `.agentree.toml` before creating tasks if those
+checks should be part of their validation contract.
+
+```toml
+# .agentree.toml
+[[checks]]
+name = "format"
+command = ["cargo", "fmt", "--all", "--", "--check"]
+required = true
+
+[[checks]]
+name = "tests"
+command = ["cargo", "test", "--all-features"]
+required = true
+timeout_seconds = 1800
+output_limit_bytes = 8388608
+```
+
+Commands are argv arrays. Agentree does not perform shell interpolation for
+configured checks; use an explicit shell executable when shell behavior is
+intentional.
+
+## Output for automation
+
+Use `--json` when integrating Agentree with scripts or another coordinator:
+
+```bash
+agentree --json status
+agentree --json context parser-error
+agentree --json check parser-error
+```
+
+The JSON envelope includes the command, result or error, and operation details
+where applicable. Human-readable output remains the default for interactive
+use.
+
+## Security boundary
+
+Agentree is a cooperative guardrail for processes launched through its session
+environment. It is not an operating-system sandbox, mandatory-access-control
+layer, or malware boundary.
+
+An in-scope process can still invoke an absolute Git binary, edit `.git`
+directly, modify files outside the worktree, or install a malicious
+filter/helper. Path overlap is heuristic and does not predict semantic merge
+conflicts. Non-UTF-8 paths, submodule-internal dirty state, sparse or split
+indexes, intent-to-add state, power loss, and filesystem destruction are
+outside the initial support guarantee.
+
+Read [Security boundary and guarantees](docs/security.md) before using
+Agentree as part of an automation or review policy.
+
+## Development
+
+```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
+cargo test --doc
 ```
 
-The CLI intentionally invokes Git with argument vectors and machine-readable
-queries. Internal history operations use deterministic Git profiles, disable
-autostash/shared rerere, and update target branches only through a checked-out
-worktree running `merge --ff-only`.
+CI runs the Rust quality checks on Ubuntu and macOS. GitHub Actions workflow
+syntax and security are checked separately with actionlint and zizmor.
+
+Architecture decisions are documented in [docs/adr](docs/adr), and interrupted
+operation procedures are collected in the [recovery runbook](docs/runbooks/recovery.md).
+
+## License
+
+MIT
