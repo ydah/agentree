@@ -105,6 +105,8 @@ Global options can be used before or after a command:
 --json                   Emit machine-readable output where supported
 --quiet                  Suppress non-essential output
 --repository <path>      Resolve the repository from an explicit path
+-h, --help               Show command help
+-V, --version            Show the installed version
 ```
 
 | Command | Purpose |
@@ -133,6 +135,16 @@ Global options can be used before or after a command:
 See the [full command reference](docs/command-reference.md) for lifecycle
 rules and recovery behavior.
 
+### Task lifecycle
+
+| State | Meaning | Typical next action |
+| --- | --- | --- |
+| `active` | The task worktree is available for development. | `run`, `check`, `checkpoint`, `sync`, or `land` |
+| `conflicted` | A sync/rebase needs an explicit resolution. | `resolve`, then `sync --continue` or `sync --abort` |
+| `landed` | The task commit was fast-forwarded into its target branch. | `remove`, then `delete-branch --yes` |
+| `archived` | Task metadata is inactive; filesystem data is retained. | Inspect or clean manually, then remove when residue-free |
+| `broken` | Recovery or manual intervention is required. | `doctor` and the [recovery runbook](docs/runbooks/recovery.md) |
+
 ## Configuration
 
 `agentree config scaffold` creates `.agentree.toml` at the repository root.
@@ -159,6 +171,51 @@ output_limit_bytes = 8388608
 Commands are argv arrays. Agentree does not perform shell interpolation for
 configured checks; use an explicit shell executable when shell behavior is
 intentional.
+
+## Common recipes
+
+### Rebase a task onto the latest target
+
+Sync is explicit and never happens implicitly during landing:
+
+```bash
+agentree fetch --remote origin
+agentree sync parser-error --onto main
+```
+
+If Git reports conflicts, resolve them through the supervised task shell and
+choose exactly one continuation:
+
+```bash
+agentree resolve parser-error --shell
+agentree sync parser-error --continue
+# or: agentree sync parser-error --abort
+```
+
+### Preserve a dirty task
+
+`remove` refuses dirty or unexpected residue. Use `archive` when the task must
+be made inactive without touching its worktree or branch:
+
+```bash
+agentree archive parser-error
+```
+
+### Diagnose an interrupted operation
+
+Keep the operation evidence intact and let `doctor` produce a plan before
+applying any known repair:
+
+```bash
+agentree doctor --json
+agentree doctor --operation <operation-id> --plan --json
+agentree doctor --operation <operation-id> --apply \
+  --plan-fingerprint <fingerprint> --json
+```
+
+Never manually delete an unknown worktree, branch, ref, or dirty path while
+recovering an operation. See the [recovery runbook](docs/runbooks/recovery.md)
+for the complete procedure.
 
 ## Output for automation
 
@@ -189,6 +246,38 @@ outside the initial support guarantee.
 
 Read [Security boundary and guarantees](docs/security.md) before using
 Agentree as part of an automation or review policy.
+
+## FAQ
+
+### Is Agentree an OS sandbox?
+
+No. It is a cooperative guardrail for processes launched through its session
+environment. A same-user process can bypass the shim with an absolute Git
+binary or direct filesystem access.
+
+### Does `overlap` detect merge conflicts?
+
+No. It reports path intersections and planned-scope violations. It cannot
+reason about semantic conflicts, generated files, or behavior-level coupling.
+
+### Why did `remove` refuse my task?
+
+`remove` is intentionally limited to an exact, residue-free managed worktree.
+Use `context <task>` to inspect the state, clean the task if appropriate, or
+use `archive <task>` to preserve dirty data without deleting it.
+
+### What happens if landing fails halfway through?
+
+Agentree records the operation and creates safety refs before the target update.
+Run `doctor --operation <id> --plan` and apply only a fresh, matching plan.
+
+## Project goals
+
+- Keep one task's branch, worktree, index, and validation contract together.
+- Make synchronization, landing, cleanup, and branch deletion explicit.
+- Prefer observable, operation-scoped recovery over guessing or broad cleanup.
+- Support both interactive workflows and scriptable JSON output.
+- Keep the safety boundary honest: useful guardrails without pretending to be a sandbox.
 
 ## Development
 
