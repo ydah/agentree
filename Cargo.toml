@@ -5,6 +5,12 @@ edition = "2021"
 rust-version = "1.80"
 description = "A safety-oriented local CLI for isolated Git worktree tasks"
 license = "MIT"
+repository = "https://github.com/ydah/agentree"
+homepage = "https://github.com/ydah/agentree"
+documentation = "https://docs.rs/agentree"
+readme = "README.md"
+keywords = ["cli", "git", "worktree", "task-runner", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "agentree"

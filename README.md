@@ -150,6 +150,12 @@ cd agentree
 cargo install --path .
 ```
 
+### Install a Release Binary
+
+Download a platform archive from the [GitHub Releases](https://github.com/ydah/agentree/releases)
+page, verify its checksum, and place the `agentree` binary somewhere on your
+`PATH`.
+
 ### Development Build
 
 ```bash
