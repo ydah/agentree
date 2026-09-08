@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Agentree is a safety-oriented Rust CLI for running independent coding tasks in isolated Git worktrees."
+    />
+    <meta name="theme-color" content="#f8fafc" />
+    <link rel="canonical" href="https://ydah.github.io/agentree/" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap"
+      rel="stylesheet"
+    />
+    <title>Agentree — Isolated worktrees for safer coding tasks</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --mist: #f8fafc;
+        --ink: #0f172a;
+        --pine: #047857;
+        --white: #ffffff;
+        --line: #cbd5e1;
+        --muted: #475569;
+        --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+        --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--mist);
+        font-family: var(--sans);
+        line-height: 1.6;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      svg {
+        display: block;
+        max-width: 100%;
+      }
+
+      .shell {
+        width: min(100% - 40px, 1180px);
+        margin-inline: auto;
+      }
+
+      .text-balance {
+        text-wrap: balance;
+      }
+
+      .text-pretty {
+        text-wrap: pretty;
+      }
+
+      .site-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 80px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 1.125rem;
+        font-weight: 700;
+        text-decoration: none;
+      }
+
+      .brand-mark {
+        display: grid;
+        place-items: center;
+        width: 28px;
+        height: 28px;
+        color: var(--white);
+        background: var(--pine);
+        border-radius: 50% 50% 50% 8px;
+      }
+
+      .brand-mark svg {
+        width: 16px;
+        height: 16px;
+      }
+
+      .nav {
+        display: flex;
+        align-items: center;
+        gap: 28px;
+      }
+
+      .nav a {
+        font-size: 0.9375rem;
+        font-weight: 500;
+        text-decoration: none;
+      }
+
+      .nav a:hover {
+        color: var(--pine);
+      }
+
+      .nav .nav-cta {
+        padding: 8px 16px;
+        color: var(--white);
+        background: var(--pine);
+        border-radius: 6px;
+      }
+
+      :focus-visible {
+        outline: 3px solid var(--pine);
+        outline-offset: 3px;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(420px, 0.9fr);
+        gap: 72px;
+        align-items: center;
+        min-height: 720px;
+        padding-block: 80px;
+      }
+
+      .hero-copy {
+        max-width: 660px;
+      }
+
+      .kicker {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0 0 24px;
+        color: var(--pine);
+        font-size: 0.9375rem;
+        font-weight: 600;
+      }
+
+      .kicker::before {
+        width: 8px;
+        height: 8px;
+        background: var(--pine);
+        border-radius: 50%;
+        content: "";
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        max-width: 12ch;
+        margin-bottom: 28px;
+        font-size: clamp(3.25rem, 7vw, 6.5rem);
+        font-weight: 600;
+        line-height: 0.94;
+      }
+
+      .hero-copy > p {
+        max-width: 58ch;
+        margin-bottom: 36px;
+        color: var(--muted);
+        font-size: clamp(1.125rem, 2vw, 1.375rem);
+        line-height: 1.55;
+      }
+
+      .hero-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        min-height: 48px;
+        padding: 10px 20px;
+        border: 1px solid var(--ink);
+        border-radius: 6px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .button-primary {
+        color: var(--white);
+        background: var(--ink);
+      }
+
+      .button-secondary:hover {
+        background: var(--white);
+      }
+
+      .tree-panel {
+        position: relative;
+        min-width: 0;
+        padding: 32px;
+        overflow: hidden;
+        background: var(--white);
+        border: 1px solid var(--line);
+        border-radius: 18px 18px 18px 4px;
+        box-shadow: 0 1px 3px rgb(15 23 42 / 0.1), 0 1px 2px rgb(15 23 42 / 0.06);
+      }
+
+      .panel-label {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 20px;
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 0.8125rem;
+      }
+
+      .panel-label span:last-child {
+        color: var(--pine);
+      }
+
+      .tree-panel svg {
+        width: 100%;
+        height: auto;
+      }
+
+      .tree-panel text {
+        fill: var(--ink);
+        font-family: var(--mono);
+        font-size: 13px;
+      }
+
+      .tree-panel .small {
+        fill: var(--muted);
+        font-size: 11px;
+      }
+
+      .trunk,
+      .branch {
+        fill: none;
+        stroke: var(--pine);
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .trunk {
+        stroke-width: 4;
+      }
+
+      .branch {
+        stroke-width: 2;
+      }
+
+      .node {
+        fill: var(--white);
+        stroke: var(--pine);
+        stroke-width: 3;
+      }
+
+      .node-filled {
+        fill: var(--pine);
+      }
+
+      .task-box {
+        fill: var(--mist);
+        stroke: var(--line);
+      }
+
+      .proof {
+        display: grid;
+        grid-template-columns: 1.2fr repeat(3, 1fr);
+        border-block: 1px solid var(--line);
+      }
+
+      .proof > * {
+        min-height: 112px;
+        padding: 24px;
+        border-right: 1px solid var(--line);
+      }
+
+      .proof > :first-child {
+        padding-left: 0;
+      }
+
+      .proof > :last-child {
+        border-right: 0;
+      }
+
+      .proof p {
+        margin: 0;
+      }
+
+      .proof-title {
+        max-width: 22ch;
+        font-weight: 600;
+        line-height: 1.4;
+      }
+
+      .proof-value {
+        font-size: 1.125rem;
+        font-weight: 600;
+      }
+
+      .proof-note {
+        color: var(--muted);
+        font-size: 0.875rem;
+      }
+
+      .section {
+        padding-block: 120px;
+      }
+
+      .section-heading {
+        display: grid;
+        grid-template-columns: 0.8fr 1.2fr;
+        gap: 64px;
+        align-items: start;
+        margin-bottom: 72px;
+      }
+
+      .section-heading h2 {
+        max-width: 12ch;
+        margin-bottom: 0;
+        font-size: clamp(2.25rem, 4vw, 4rem);
+        font-weight: 600;
+        line-height: 1;
+      }
+
+      .section-heading p {
+        max-width: 58ch;
+        margin-bottom: 0;
+        color: var(--muted);
+        font-size: 1.125rem;
+      }
+
+      .lifecycle {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        border-top: 2px solid var(--ink);
+      }
+
+      .stage {
+        padding: 28px 24px 0 0;
+        border-right: 1px solid var(--line);
+      }
+
+      .stage + .stage {
+        padding-left: 24px;
+      }
+
+      .stage:last-child {
+        border-right: 0;
+      }
+
+      .stage-number {
+        margin-bottom: 40px;
+        color: var(--pine);
+        font-family: var(--mono);
+        font-size: 0.875rem;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .stage h3 {
+        margin-bottom: 12px;
+        font-size: 1.375rem;
+      }
+
+      .stage p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.9375rem;
+      }
+
+      .safety {
+        color: var(--white);
+        background: var(--ink);
+      }
+
+      .safety .section-heading p {
+        color: #cbd5e1;
+      }
+
+      .safety-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1px;
+        background: #334155;
+        border: 1px solid #334155;
+      }
+
+      .safety-item {
+        min-height: 260px;
+        padding: 40px;
+        background: var(--ink);
+      }
+
+      .safety-item svg {
+        width: 28px;
+        height: 28px;
+        margin-bottom: 48px;
+        color: #6ee7b7;
+      }
+
+      .safety-item h3 {
+        margin-bottom: 12px;
+        font-size: 1.5rem;
+      }
+
+      .safety-item p {
+        max-width: 48ch;
+        margin-bottom: 0;
+        color: #cbd5e1;
+      }
+
+      .install {
+        display: grid;
+        grid-template-columns: 0.8fr 1.2fr;
+        gap: 72px;
+        align-items: center;
+      }
+
+      .install h2 {
+        max-width: 10ch;
+        margin-bottom: 20px;
+        font-size: clamp(2.25rem, 4vw, 4rem);
+        font-weight: 600;
+        line-height: 1;
+      }
+
+      .install-copy p {
+        max-width: 42ch;
+        color: var(--muted);
+        font-size: 1.125rem;
+      }
+
+      .terminal {
+        overflow: hidden;
+        color: #f1f5f9;
+        background: var(--ink);
+        border-radius: 12px 12px 12px 4px;
+        box-shadow: 0 10px 15px -3px rgb(15 23 42 / 0.1), 0 4px 6px -4px rgb(15 23 42 / 0.1);
+      }
+
+      .terminal-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 14px 18px;
+        border-bottom: 1px solid #334155;
+      }
+
+      .terminal-dot {
+        width: 8px;
+        height: 8px;
+        background: #64748b;
+        border-radius: 50%;
+      }
+
+      pre {
+        margin: 0;
+        padding: 28px;
+        overflow-x: auto;
+        font-family: var(--mono);
+        font-size: 0.875rem;
+        line-height: 1.9;
+      }
+
+      code .prompt,
+      code .ok {
+        color: #6ee7b7;
+      }
+
+      .footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 120px;
+        border-top: 1px solid var(--line);
+      }
+
+      .footer p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.875rem;
+      }
+
+      .footer-links {
+        display: flex;
+        gap: 24px;
+      }
+
+      .footer-links a {
+        font-size: 0.875rem;
+      }
+
+      @media (max-width: 900px) {
+        .hero,
+        .section-heading,
+        .install {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        .hero {
+          min-height: auto;
+          gap: 56px;
+          padding-block: 72px;
+        }
+
+        .tree-panel {
+          max-width: 620px;
+        }
+
+        .proof {
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .proof > :nth-child(2) {
+          border-right: 0;
+        }
+
+        .proof > :first-child {
+          padding-left: 24px;
+        }
+
+        .proof > :nth-child(-n + 2) {
+          border-bottom: 1px solid var(--line);
+        }
+
+        .section {
+          padding-block: 88px;
+        }
+
+        .section-heading {
+          gap: 24px;
+          margin-bottom: 56px;
+        }
+
+        .lifecycle {
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .stage:nth-child(2) {
+          border-right: 0;
+        }
+
+        .stage:nth-child(-n + 2) {
+          padding-bottom: 40px;
+          border-bottom: 1px solid var(--line);
+        }
+
+        .stage:nth-child(n + 3) {
+          padding-top: 40px;
+        }
+      }
+
+      @media (max-width: 620px) {
+        .shell {
+          width: min(100% - 32px, 1180px);
+        }
+
+        .site-header {
+          min-height: 68px;
+        }
+
+        .nav a:not(.nav-cta) {
+          display: none;
+        }
+
+        .hero {
+          padding-block: 56px 72px;
+        }
+
+        h1 {
+          font-size: clamp(3rem, 16vw, 4.5rem);
+        }
+
+        .tree-panel {
+          padding: 20px;
+        }
+
+        .proof,
+        .lifecycle,
+        .safety-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .proof > *,
+        .proof > :nth-child(2),
+        .stage,
+        .stage:nth-child(2) {
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+
+        .proof > :last-child,
+        .stage:last-child {
+          border-bottom: 0;
+        }
+
+        .proof > :nth-child(3) {
+          border-bottom: 1px solid var(--line);
+        }
+
+        .stage,
+        .stage + .stage,
+        .stage:nth-child(n + 3) {
+          padding: 28px 0;
+        }
+
+        .stage-number {
+          margin-bottom: 20px;
+        }
+
+        .safety-item {
+          min-height: auto;
+          padding: 32px 24px;
+        }
+
+        .safety-item svg {
+          margin-bottom: 32px;
+        }
+
+        .install {
+          gap: 40px;
+        }
+
+        pre {
+          padding: 22px;
+          font-size: 0.75rem;
+        }
+
+        .footer {
+          align-items: flex-start;
+          flex-direction: column;
+          justify-content: center;
+          gap: 12px;
+          padding-block: 32px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="shell site-header">
+      <a class="brand" href="#top" aria-label="Agentree home">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 20V6m0 7 6-5m-6 2L7 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </span>
+        Agentree
+      </a>
+      <nav class="nav" aria-label="Primary navigation">
+        <a href="#how-it-works">How it works</a>
+        <a href="https://github.com/ydah/agentree#usage">Docs</a>
+        <a class="nav-cta" href="https://github.com/ydah/agentree">View on GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="shell hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="kicker">A safety-oriented Rust CLI</p>
+          <h1 id="hero-title" class="text-balance">Let every task grow on its own branch.</h1>
+          <p class="text-pretty">
+            Agentree gives coding tasks separate Git worktrees, checks, and landing paths—so parallel work stays
+            inspectable from first commit to final merge.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#install">Install Agentree</a>
+            <a class="button button-secondary" href="https://github.com/ydah/agentree#quick-start">Read the quick start</a>
+          </div>
+        </div>
+
+        <div class="tree-panel">
+          <div class="panel-label" aria-hidden="true">
+            <span>task topology</span>
+            <span>ready to land</span>
+          </div>
+          <svg viewBox="0 0 520 510" role="img" aria-labelledby="tree-title tree-desc">
+            <title id="tree-title">Three isolated tasks branching from and returning to main</title>
+            <desc id="tree-desc">A diagram showing separate parser, docs, and release worktrees checked before landing.</desc>
+
+            <path class="trunk" d="M72 452V60" />
+            <path class="branch" d="M72 365C105 365 104 302 142 302H194" />
+            <path class="branch" d="M72 252C112 252 106 185 152 185H254" />
+            <path class="branch" d="M72 139C112 139 112 94 152 94H194" />
+            <path class="branch" d="M194 302H262C300 302 300 365 338 365H422" />
+            <path class="branch" d="M254 185H310C350 185 350 252 390 252H422" />
+            <path class="branch" d="M194 94H280C326 94 326 139 370 139H422" />
+
+            <circle class="node node-filled" cx="72" cy="452" r="8" />
+            <circle class="node" cx="72" cy="365" r="7" />
+            <circle class="node" cx="72" cy="252" r="7" />
+            <circle class="node" cx="72" cy="139" r="7" />
+            <circle class="node node-filled" cx="72" cy="60" r="8" />
+            <circle class="node node-filled" cx="422" cy="365" r="7" />
+            <circle class="node node-filled" cx="422" cy="252" r="7" />
+            <circle class="node node-filled" cx="422" cy="139" r="7" />
+
+            <rect class="task-box" x="142" y="275" width="120" height="54" rx="7" />
+            <rect class="task-box" x="152" y="158" width="158" height="54" rx="7" />
+            <rect class="task-box" x="152" y="67" width="128" height="54" rx="7" />
+            <text x="158" y="298">parser-error</text>
+            <text class="small" x="158" y="316">check ✓</text>
+            <text x="168" y="181">docs-refresh</text>
+            <text class="small" x="168" y="199">check ✓</text>
+            <text x="168" y="90">release-fix</text>
+            <text class="small" x="168" y="108">check ✓</text>
+
+            <text x="92" y="456">main</text>
+            <text class="small" x="92" y="65">fast-forward only</text>
+            <text class="small" x="438" y="143">land</text>
+            <text class="small" x="438" y="256">land</text>
+            <text class="small" x="438" y="369">land</text>
+          </svg>
+        </div>
+      </section>
+
+      <section class="shell proof" aria-label="Agentree at a glance">
+        <p class="proof-title text-pretty">Boundaries you can inspect, not conventions you have to trust.</p>
+        <div>
+          <p class="proof-value">Rust native</p>
+          <p class="proof-note">One focused CLI</p>
+        </div>
+        <div>
+          <p class="proof-value">Git worktrees</p>
+          <p class="proof-note">Real filesystem isolation</p>
+        </div>
+        <div>
+          <p class="proof-value">MIT licensed</p>
+          <p class="proof-note">Open source</p>
+        </div>
+      </section>
+
+      <section id="how-it-works" class="shell section" aria-labelledby="lifecycle-title">
+        <div class="section-heading">
+          <h2 id="lifecycle-title" class="text-balance">A deliberate path from task to trunk.</h2>
+          <p class="text-pretty">
+            Work never drifts into the target branch by accident. Each transition is explicit, reviewable, and tied
+            to an exact revision.
+          </p>
+        </div>
+        <div class="lifecycle">
+          <article class="stage">
+            <p class="stage-number">01</p>
+            <h3 class="text-balance">Create</h3>
+            <p class="text-pretty">Start from an exact base commit with a dedicated branch, worktree, and Git index.</p>
+          </article>
+          <article class="stage">
+            <p class="stage-number">02</p>
+            <h3 class="text-balance">Run and check</h3>
+            <p class="text-pretty">Supervise commands locally and record checks against the task’s exact HEAD.</p>
+          </article>
+          <article class="stage">
+            <p class="stage-number">03</p>
+            <h3 class="text-balance">Sync</h3>
+            <p class="text-pretty">Rebase onto a chosen target commit and resolve conflicts deliberately.</p>
+          </article>
+          <article class="stage">
+            <p class="stage-number">04</p>
+            <h3 class="text-balance">Land</h3>
+            <p class="text-pretty">Fast-forward the target only when the task state and revision are ready.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="safety">
+        <div class="shell section">
+          <div class="section-heading">
+            <h2 class="text-balance">Safety lives in the workflow.</h2>
+            <p class="text-pretty">
+              Agentree makes risky shortcuts difficult and recovery information durable, without hiding Git behind a
+              new mental model.
+            </p>
+          </div>
+          <div class="safety-grid">
+            <article class="safety-item">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M4 12h16M12 4v16" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+              </svg>
+              <h3 class="text-balance">Isolation that is real</h3>
+              <p class="text-pretty">Each task owns its working directory and index. Parallel agents do not share mutable worktree state.</p>
+            </article>
+            <article class="safety-item">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="m5 12 4 4L19 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <h3 class="text-balance">Checks with provenance</h3>
+              <p class="text-pretty">Required commands, configuration, and revision are recorded together, so “passed” keeps its meaning.</p>
+            </article>
+            <article class="safety-item">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M5 6h10a4 4 0 0 1 4 4v8M9 2 5 6l4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <h3 class="text-balance">No surprise landing</h3>
+              <p class="text-pretty">Sync and land stay separate. Integration is an explainable fast-forward, never a silent rebase.</p>
+            </article>
+            <article class="safety-item">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M12 8v5l3 2M12 3a9 9 0 1 0 9 9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <h3 class="text-balance">Recovery leaves a trail</h3>
+              <p class="text-pretty">Journals, checkpoints, and plan-first diagnostics keep interrupted operations inspectable.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="install" class="shell section install" aria-labelledby="install-title">
+        <div class="install-copy">
+          <h2 id="install-title" class="text-balance">Start with one task.</h2>
+          <p class="text-pretty">Install from crates.io, initialize an existing Git repository, and give the next change its own worktree.</p>
+          <a class="button button-secondary" href="https://github.com/ydah/agentree#usage">Open full documentation</a>
+        </div>
+        <div class="terminal" aria-label="Agentree quick start commands">
+          <div class="terminal-bar" aria-hidden="true">
+            <span class="terminal-dot"></span>
+            <span class="terminal-dot"></span>
+            <span class="terminal-dot"></span>
+          </div>
+          <pre><code><span class="prompt">$</span> cargo install agentree --locked
+<span class="prompt">$</span> cd path/to/repository
+<span class="prompt">$</span> agentree init
+<span class="prompt">$</span> agentree new parser-error --base main
+<span class="prompt">$</span> agentree run parser-error -- cargo test
+<span class="prompt">$</span> agentree check parser-error
+<span class="ok">✓ task/parser-error is ready to land</span></code></pre>
+        </div>
+      </section>
+    </main>
+
+    <footer class="shell footer">
+      <p>Agentree is open-source software released under the MIT License.</p>
+      <div class="footer-links">
+        <a href="https://github.com/ydah/agentree">GitHub</a>
+        <a href="https://crates.io/crates/agentree">crates.io</a>
+        <a href="https://docs.rs/agentree">docs.rs</a>
+      </div>
+    </footer>
+  </body>
+</html>
