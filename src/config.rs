@@ -60,7 +60,7 @@ pub fn snapshot(git: &GitRunner, root: &Path, base_oid: &str) -> Result<ConfigSn
     let parsed: toml::Value = if raw.trim().is_empty() {
         toml::Value::Table(Default::default())
     } else {
-        raw.parse()?
+        toml::from_str(&raw)?
     };
     let json = serde_json::to_value(&parsed)
         .map_err(|error| AppError::diagnostic("AGT-0402", error.to_string(), ErrorKind::Usage))?;
