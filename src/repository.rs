@@ -4,10 +4,9 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{
-    domain::{AppError, ErrorKind},
+    domain::{sha256_hex, AppError, ErrorKind},
     git::{args, GitRunner},
 };
 
@@ -210,14 +209,10 @@ fn canonical(path: PathBuf) -> Result<PathBuf, AppError> {
     fs::canonicalize(path).map_err(AppError::from)
 }
 fn repository_id(common_dir: &Path) -> String {
-    let mut hash = Sha256::new();
-    hash.update(
-        common_dir
-            .to_str()
-            .unwrap_or("<unsupported-path>")
-            .as_bytes(),
-    );
-    format!("repo-{:x}", hash.finalize())
+    format!(
+        "repo-{}",
+        sha256_hex(common_dir.to_str().unwrap_or("<unsupported-path>"))
+    )
 }
 fn now() -> u64 {
     std::time::SystemTime::now()
