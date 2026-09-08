@@ -378,11 +378,18 @@ impl State {
                 crate::domain::ErrorKind::Database,
             )
         })?;
-        Ok(connection.query_row(
+        let count: i64 = connection.query_row(
             "SELECT COUNT(*) FROM sessions WHERE task_id=?1 AND status IN ('starting','running')",
             params![task_id],
             |row| row.get(0),
-        )?)
+        )?;
+        usize::try_from(count).map_err(|_| {
+            AppError::diagnostic(
+                "AGT-0307",
+                "session count is outside platform limits",
+                crate::domain::ErrorKind::Database,
+            )
+        })
     }
 
     pub fn active_session_for_process_group(
