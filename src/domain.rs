@@ -4,6 +4,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -81,6 +82,17 @@ impl AppError {
             | Self::Git(_) => 1,
         }
     }
+}
+
+pub fn sha256_hex(input: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(input);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 #[derive(Debug, Error)]
@@ -337,5 +349,18 @@ impl WorktreeContentState {
             && self.nonignored_residue.is_empty()
             && self.visibility_flags.is_empty()
             && !self.in_progress
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256_hex;
+
+    #[test]
+    fn sha256_is_lowercase_hex() {
+        assert_eq!(
+            sha256_hex([]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 }

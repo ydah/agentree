@@ -14,7 +14,6 @@ use std::{
 };
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::{
     cli::{
@@ -23,8 +22,8 @@ use crate::{
     },
     config,
     domain::{
-        AppError, BranchRef, ErrorKind, InternalGitProfile, JsonEnvelope, Lifecycle, OperationKind,
-        OperationStatus,
+        sha256_hex, AppError, BranchRef, ErrorKind, InternalGitProfile, JsonEnvelope, Lifecycle,
+        OperationKind, OperationStatus,
     },
     git::{args, GitRunner},
     lock::FileLock,
@@ -2787,9 +2786,7 @@ fn rebase_state_dir(git: &GitRunner, worktree: &Path) -> Result<Option<PathBuf>,
 
 fn sha256_file(path: &Path) -> Result<String, AppError> {
     let bytes = fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(sha256_hex(bytes))
 }
 
 fn ref_snapshot(git: &GitRunner, root: &Path) -> Result<BTreeMap<String, String>, AppError> {
@@ -2840,9 +2837,7 @@ fn ensure_index_unlocked(index: &Path) -> Result<(), AppError> {
 
 fn hash_json<T: Serialize>(value: &T) -> Result<String, AppError> {
     let bytes = serde_json::to_vec(value)?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", sha256_hex(bytes)))
 }
 
 fn process_birth_identity(pid: u32) -> String {

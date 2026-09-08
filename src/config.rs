@@ -1,10 +1,9 @@
 use std::{collections::BTreeMap, ffi::OsString, path::Path};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{
-    domain::{AppError, ErrorKind, InternalGitProfile},
+    domain::{sha256_hex, AppError, ErrorKind, InternalGitProfile},
     git::GitRunner,
 };
 
@@ -70,9 +69,7 @@ pub fn snapshot(git: &GitRunner, root: &Path, base_oid: &str) -> Result<ConfigSn
     };
     let checks = parse_checks(table.get("checks"))?;
     let canonical = serde_json::to_vec(&table)?;
-    let mut hasher = Sha256::new();
-    hasher.update(canonical);
-    let hash = format!("sha256:{:x}", hasher.finalize());
+    let hash = format!("sha256:{}", sha256_hex(canonical));
     Ok(ConfigSnapshot {
         hash,
         source_oid: base_oid.to_owned(),
